@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/delivery_tracking?schema=public
+      REDIS_URL: redis://localhost:6379
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: delivery_tracking
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d delivery_tracking"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run db:validate
+      - run: npm run db:generate
+      - run: npm run db:migrate:deploy
+      - run: npm run format:check
+      - run: npm run lint
+      - run: npm run build
+      - run: npm test -- --runInBand
+      - run: npm run test:e2e -- --runInBand
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t delivery-order-tracking-api:ci .

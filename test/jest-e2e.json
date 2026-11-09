@@ -1,0 +1,25 @@
+{
+  "extensionsToTreatAsEsm": [".ts"],
+  "moduleFileExtensions": ["js", "json", "ts"],
+  "rootDir": ".",
+  "maxWorkers": 1,
+  "testTimeout": 30000,
+  "setupFiles": ["<rootDir>/setup-env.js"],
+  "testEnvironment": "node",
+  "testRegex": ".e2e-spec.ts$",
+  "moduleNameMapper": {
+    "^(\\.{1,2}/.*)\\.js$": "$1"
+  },
+  "transform": {
+    "^.+\\.(t|j)s$": [
+      "ts-jest",
+      {
+        "useESM": true,
+        "tsconfig": {
+          "module": "ESNext",
+          "moduleResolution": "Bundler"
+        }
+      }
+    ]
+  }
+}
