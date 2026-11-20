@@ -1,17 +1,19 @@
 import { INestApplication } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
+import type { Model } from 'mongoose';
 import { App } from 'supertest/types';
 import request from 'supertest';
 import { configureApp } from '../../src/app.setup';
 import { AppModule } from '../../src/app.module';
+import { DatabaseService } from '../../src/database/database.service';
+import { allModels } from '../../src/database/models';
 import { EmailSender } from '../../src/notifications/email.sender';
-import { PrismaService } from '../../src/prisma/prisma.service';
 import { RedisIoAdapter } from '../../src/redis/redis-io.adapter';
 import { RedisService } from '../../src/redis/redis.service';
 
 export interface TestApp {
   app: INestApplication<App>;
-  prisma: PrismaService;
+  database: DatabaseService;
 }
 
 export interface CreateTestAppOptions {
@@ -54,14 +56,14 @@ export async function createTestApp(
 
   return {
     app,
-    prisma: app.get(PrismaService),
+    database: app.get(DatabaseService),
   };
 }
 
-export async function resetDatabase(prisma: PrismaService): Promise<void> {
-  await prisma.$executeRawUnsafe(
-    'TRUNCATE TABLE "RefreshToken", "DeliveryStatusHistory", "DeliveryAssignment", "DeliveryLocation", "Payment", "Notification", "Delivery", "Order", "User" CASCADE',
-  );
+export async function resetDatabase(): Promise<void> {
+  for (const model of [...allModels].reverse()) {
+    await (model as unknown as Model<Record<string, unknown>>).deleteMany({});
+  }
 }
 
 export async function registerCustomer(

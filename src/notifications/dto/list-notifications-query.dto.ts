@@ -1,5 +1,5 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
-import { NotificationStatus } from '../../generated/prisma/enums';
+import { NotificationStatus } from '../../database/enums';
 import { Type } from 'class-transformer';
 import {
   IsEnum,

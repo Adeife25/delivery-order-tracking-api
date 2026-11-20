@@ -1,5 +1,21 @@
-import { DeliveryStatus } from '../generated/prisma/client';
-import { calculateRiderMetrics } from './admin.service';
+import { jest } from '@jest/globals';
+import { DeliveryStatus } from '../database/enums';
+
+jest.unstable_mockModule('../database/database.service', () => ({
+  DatabaseService: class {},
+  isDuplicateKeyError: () => false,
+  sessionOptions: () => ({}),
+}));
+jest.unstable_mockModule('../database/models', () => ({
+  DeliveryAssignmentModel: {},
+  DeliveryModel: {},
+  OrderModel: {},
+  PaymentModel: {},
+  RefreshTokenModel: {},
+  UserModel: {},
+}));
+
+const { calculateRiderMetrics } = await import('./admin.service');
 
 describe('calculateRiderMetrics', () => {
   it('returns empty metrics for a rider without deliveries', () => {

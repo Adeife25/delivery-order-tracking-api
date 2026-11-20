@@ -4,7 +4,7 @@ import { App } from 'supertest/types';
 import { EmailSender } from '../src/notifications/email.sender';
 import { NotificationsQueue } from '../src/notifications/notifications.queue';
 import { NotificationsService } from '../src/notifications/notifications.service';
-import { PrismaService } from '../src/prisma/prisma.service';
+import { NotificationModel } from '../src/database/models';
 import {
   createTestApp,
   registerCustomer,
@@ -23,10 +23,9 @@ const sleep = (milliseconds: number) =>
 
 describe('Notification queue (e2e)', () => {
   let app: INestApplication<App>;
-  let prisma: PrismaService;
   let notifications: NotificationsService;
   let queue: NotificationsQueue;
-  let emailSend: jest.Mock;
+  let emailSend: jest.Mock<(...args: unknown[]) => Promise<unknown>>;
   let userId: string;
 
   const password = 'strong-password-123';
@@ -39,15 +38,23 @@ describe('Notification queue (e2e)', () => {
     const deadline = Date.now() + timeout;
 
     while (Date.now() < deadline) {
-      const notification = (await prisma.notification.findUnique({
-        where: { id },
-        select: {
-          id: true,
-          status: true,
-          attempts: true,
-          nextAttemptAt: true,
-        },
-      })) as NotificationRow | null;
+      const doc = (await NotificationModel.findById(id)
+        .select('_id status attempts nextAttemptAt')
+        .lean()) as unknown as {
+        _id: string;
+        status: string;
+        attempts: number;
+        nextAttemptAt: Date | null;
+      } | null;
+
+      const notification: NotificationRow | null = doc
+        ? {
+            id: doc._id,
+            status: doc.status,
+            attempts: doc.attempts,
+            nextAttemptAt: doc.nextAttemptAt,
+          }
+        : null;
 
       if (notification && predicate(notification)) {
         return notification;
@@ -60,13 +67,12 @@ describe('Notification queue (e2e)', () => {
   }
 
   beforeAll(async () => {
-    emailSend = jest.fn();
+    emailSend = jest.fn(async (): Promise<unknown> => undefined);
     const testApp = await createTestApp({
       emailSender: { send: emailSend } as unknown as EmailSender,
     });
     app = testApp.app;
-    prisma = testApp.prisma;
-    await resetDatabase(prisma);
+    await resetDatabase();
 
     notifications = app.get(NotificationsService);
     queue = app.get(NotificationsQueue);
@@ -80,7 +86,7 @@ describe('Notification queue (e2e)', () => {
   });
 
   afterAll(async () => {
-    await resetDatabase(prisma);
+    await resetDatabase();
     await app.close();
   });
 
@@ -90,7 +96,7 @@ describe('Notification queue (e2e)', () => {
       .mockRejectedValueOnce(new Error('temporary failure'))
       .mockResolvedValue(undefined);
 
-    const notificationId = await notifications.createInTransaction(prisma, {
+    const notificationId = await notifications.createInTransaction({
       userId,
       type: 'ORDER_CREATED',
       title: 'Order created',
@@ -107,10 +113,10 @@ describe('Notification queue (e2e)', () => {
         notification.status === 'PENDING',
     );
 
-    await prisma.notification.update({
-      where: { id: notificationId },
-      data: { nextAttemptAt: new Date(Date.now() - 1000) },
-    });
+    await NotificationModel.updateOne(
+      { _id: notificationId },
+      { $set: { nextAttemptAt: new Date(Date.now() - 1000) } },
+    );
 
     await notifications.retryPending();
 
@@ -128,7 +134,7 @@ describe('Notification queue (e2e)', () => {
     emailSend.mockClear();
     emailSend.mockResolvedValue(undefined);
 
-    const notificationId = await notifications.createInTransaction(prisma, {
+    const notificationId = await notifications.createInTransaction({
       userId,
       type: 'DELIVERY_ACCEPTED',
       title: 'Delivery accepted',

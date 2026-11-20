@@ -1,8 +1,10 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
-import { PrismaService } from '../prisma/prisma.service';
-import { User, UserRole } from '../generated/prisma/client';
+import { DatabaseService } from '../database/database.service';
+import { UserRole } from '../database/enums';
+import { UserModel } from '../database/models';
+import { PublicUser, UserDoc, toPublicUser } from '../database/views';
+import { USER_PUBLIC_FIELDS } from '../database/populate';
 import { UpdateProfileDto } from './dto/update-profile.dto';
-import { publicUserSelect, PublicUser } from './users.select';
 
 interface CreateCustomerInput {
   fullName: string;
@@ -13,44 +15,40 @@ interface CreateCustomerInput {
 
 @Injectable()
 export class UsersService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(private readonly database: DatabaseService) {}
 
   async createCustomer(input: CreateCustomerInput): Promise<PublicUser> {
-    return this.prisma.user.create({
-      data: {
-        fullName: input.fullName,
-        email: input.email,
-        passwordHash: input.passwordHash,
-        phoneNumber: input.phoneNumber,
-        role: UserRole.CUSTOMER,
-      },
-      select: publicUserSelect,
+    const user = await UserModel.create({
+      fullName: input.fullName,
+      email: input.email,
+      passwordHash: input.passwordHash,
+      phoneNumber: input.phoneNumber ?? null,
+      role: UserRole.CUSTOMER,
     });
+
+    return toPublicUser(user.toObject() as unknown as UserDoc);
   }
 
-  findByEmail(email: string): Promise<User | null> {
-    return this.prisma.user.findUnique({
-      where: { email },
-    });
+  async findByEmail(email: string): Promise<UserDoc | null> {
+    return (await UserModel.findOne({
+      email,
+    }).lean()) as unknown as UserDoc | null;
   }
 
-  findById(id: string): Promise<User | null> {
-    return this.prisma.user.findUnique({
-      where: { id },
-    });
+  async findById(id: string): Promise<UserDoc | null> {
+    return (await UserModel.findById(id).lean()) as unknown as UserDoc | null;
   }
 
   async getProfile(id: string): Promise<PublicUser> {
-    const user = await this.prisma.user.findUnique({
-      where: { id },
-      select: publicUserSelect,
-    });
+    const user = (await UserModel.findById(id)
+      .select(USER_PUBLIC_FIELDS)
+      .lean()) as unknown as UserDoc | null;
 
     if (!user) {
       throw new NotFoundException('User not found');
     }
 
-    return user;
+    return toPublicUser(user);
   }
 
   async updateProfile(id: string, dto: UpdateProfileDto): Promise<PublicUser> {
@@ -58,17 +56,26 @@ export class UsersService {
       return this.getProfile(id);
     }
 
-    const user = await this.prisma.user.update({
-      where: { id },
-      data: {
-        ...(dto.fullName !== undefined && { fullName: dto.fullName }),
-        ...(dto.phoneNumber !== undefined && {
-          phoneNumber: dto.phoneNumber,
-        }),
-      },
-      select: publicUserSelect,
-    });
+    const update: Record<string, unknown> = {};
+    if (dto.fullName !== undefined) {
+      update.fullName = dto.fullName;
+    }
+    if (dto.phoneNumber !== undefined) {
+      update.phoneNumber = dto.phoneNumber;
+    }
 
-    return user;
+    const user = (await UserModel.findByIdAndUpdate(
+      id,
+      { $set: update },
+      { new: true },
+    )
+      .select(USER_PUBLIC_FIELDS)
+      .lean()) as unknown as UserDoc | null;
+
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+
+    return toPublicUser(user);
   }
 }

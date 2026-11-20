@@ -1,14 +1,12 @@
 FROM node:22-alpine AS build
 WORKDIR /app
-ENV DATABASE_URL=postgresql://postgres:postgres@localhost:5432/delivery_tracking?schema=public
+ENV DATABASE_URL=mongodb://localhost:27017/delivery_tracking?replicaSet=rs0
 
 COPY package*.json ./
-COPY prisma ./prisma
-COPY prisma.config.ts ./
 RUN npm ci
 
 COPY . .
-RUN npm run db:generate && npm run build
+RUN npm run build
 RUN npm prune --omit=dev
 
 FROM node:22-alpine AS runtime

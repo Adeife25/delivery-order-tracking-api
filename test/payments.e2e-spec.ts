@@ -2,7 +2,8 @@ import { INestApplication } from '@nestjs/common';
 import { createHmac } from 'crypto';
 import { App } from 'supertest/types';
 import request from 'supertest';
-import { PrismaService } from '../src/prisma/prisma.service';
+import { UserRole } from '../src/database/enums';
+import { UserModel } from '../src/database/models';
 import { PaystackMock } from './helpers/paystack-mock';
 import {
   createTestApp,
@@ -28,7 +29,6 @@ describe('Payment endpoints (e2e)', () => {
   const paystackSecret = 'sk_test_paystack_secret_key_for_test_suite';
 
   let app: INestApplication<App>;
-  let prisma: PrismaService;
   let paystack: PaystackMock;
 
   let customer: Session;
@@ -104,8 +104,7 @@ describe('Payment endpoints (e2e)', () => {
 
     const testApp = await createTestApp();
     app = testApp.app;
-    prisma = testApp.prisma;
-    await resetDatabase(prisma);
+    await resetDatabase();
 
     customer = await registerCustomer(app, {
       fullName: 'Paying Customer',
@@ -123,10 +122,10 @@ describe('Payment endpoints (e2e)', () => {
       password,
     });
 
-    await prisma.user.update({
-      where: { email: 'payment-admin@example.com' },
-      data: { role: 'ADMIN' },
-    });
+    await UserModel.updateOne(
+      { email: 'payment-admin@example.com' },
+      { $set: { role: UserRole.ADMIN } },
+    );
 
     const login = await api()
       .post('/api/v1/auth/login')

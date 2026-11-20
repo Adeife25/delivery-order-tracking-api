@@ -1,14 +1,17 @@
 import { Injectable, Logger, OnApplicationBootstrap } from '@nestjs/common';
 import { Interval } from '@nestjs/schedule';
-import { NotificationStatus, Prisma } from '../generated/prisma/client';
-import { PrismaService } from '../prisma/prisma.service';
+import type { ClientSession } from 'mongoose';
+import { DatabaseService } from '../database/database.service';
+import { NotificationStatus } from '../database/enums';
+import { NotificationModel } from '../database/models';
+import { NotificationDoc } from '../database/views';
 import { EmailSender } from './email.sender';
 import { ListNotificationsQueryDto } from './dto/list-notifications-query.dto';
 import {
   NotificationsQueue,
   RETRY_POLL_INTERVAL_MS,
 } from './notifications.queue';
-import { NotificationView, notificationSelect } from './notifications.select';
+import { NotificationView, toNotificationView } from './notifications.select';
 
 export interface CreateNotificationInput {
   userId: string;
@@ -24,15 +27,13 @@ function retryDelay(attempt: number): number {
   return RETRY_BASE_DELAY_MS * 2 ** Math.max(0, attempt - 1);
 }
 
-type NotificationWriter = Pick<Prisma.TransactionClient, 'notification'>;
-
 @Injectable()
 export class NotificationsService implements OnApplicationBootstrap {
   private readonly logger = new Logger(NotificationsService.name);
   private readonly inFlight = new Set<string>();
 
   constructor(
-    private readonly prisma: PrismaService,
+    private readonly database: DatabaseService,
     private readonly emailSender: EmailSender,
     private readonly queue: NotificationsQueue,
   ) {}
@@ -59,7 +60,7 @@ export class NotificationsService implements OnApplicationBootstrap {
 
   async notify(input: CreateNotificationInput): Promise<void> {
     try {
-      const notificationId = await this.createInTransaction(this.prisma, input);
+      const notificationId = await this.createInTransaction(input);
       void this.deliver(notificationId);
     } catch {
       this.logger.error(
@@ -69,21 +70,24 @@ export class NotificationsService implements OnApplicationBootstrap {
   }
 
   async createInTransaction(
-    writer: NotificationWriter,
     input: CreateNotificationInput,
+    session?: ClientSession,
   ): Promise<string> {
-    const notification = await writer.notification.create({
-      data: {
-        userId: input.userId,
-        type: input.type,
-        title: input.title,
-        message: input.message,
-        status: NotificationStatus.PENDING,
-      },
-      select: { id: true },
-    });
+    const [notification] = await NotificationModel.create(
+      [
+        {
+          userId: input.userId,
+          type: input.type,
+          title: input.title,
+          message: input.message,
+          status: NotificationStatus.PENDING,
+          attempts: 0,
+        },
+      ],
+      { session },
+    );
 
-    return notification.id;
+    return notification._id.toString();
   }
 
   async enqueue(notificationIds: readonly string[]): Promise<void> {
@@ -92,17 +96,16 @@ export class NotificationsService implements OnApplicationBootstrap {
 
   async retryPending(): Promise<void> {
     try {
-      const pending = await this.prisma.notification.findMany({
-        where: {
-          status: NotificationStatus.PENDING,
-          OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: new Date() } }],
-        },
-        orderBy: { createdAt: 'asc' },
-        take: 100,
-        select: { id: true },
-      });
+      const pending = (await NotificationModel.find({
+        status: NotificationStatus.PENDING,
+        $or: [{ nextAttemptAt: null }, { nextAttemptAt: { $lte: new Date() } }],
+      })
+        .sort({ createdAt: 1 })
+        .limit(100)
+        .select('_id')
+        .lean()) as unknown as Array<{ _id: string }>;
 
-      await Promise.all(pending.map(({ id }) => this.deliver(id)));
+      await Promise.all(pending.map(({ _id }) => this.deliver(_id)));
     } catch {
       this.logger.error('Could not load pending notifications');
     }
@@ -143,18 +146,9 @@ export class NotificationsService implements OnApplicationBootstrap {
     this.inFlight.add(notificationId);
 
     try {
-      const notification = await this.prisma.notification.findUnique({
-        where: { id: notificationId },
-        select: {
-          id: true,
-          status: true,
-          attempts: true,
-          nextAttemptAt: true,
-          title: true,
-          message: true,
-          user: { select: { email: true } },
-        },
-      });
+      const notification = (await NotificationModel.findById(notificationId)
+        .populate('user', 'email')
+        .lean()) as unknown as NotificationDoc | null;
 
       if (
         !notification ||
@@ -164,17 +158,20 @@ export class NotificationsService implements OnApplicationBootstrap {
         return;
       }
 
-      const claimed = await this.prisma.notification.updateMany({
-        where: {
-          id: notificationId,
+      const claimed = await NotificationModel.updateOne(
+        {
+          _id: notificationId,
           status: NotificationStatus.PENDING,
           attempts: notification.attempts,
-          OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: new Date() } }],
+          $or: [
+            { nextAttemptAt: null },
+            { nextAttemptAt: { $lte: new Date() } },
+          ],
         },
-        data: { attempts: { increment: 1 } },
-      });
+        { $inc: { attempts: 1 } },
+      );
 
-      if (claimed.count !== 1) {
+      if (claimed.modifiedCount !== 1) {
         return;
       }
 
@@ -182,48 +179,42 @@ export class NotificationsService implements OnApplicationBootstrap {
 
       try {
         await this.emailSender.send({
-          to: notification.user.email,
+          to: notification.user?.email ?? '',
           subject: notification.title,
           text: notification.message,
         });
 
-        await this.prisma.notification.updateMany({
-          where: {
-            id: notificationId,
-            status: NotificationStatus.PENDING,
-          },
-          data: {
-            status: NotificationStatus.SENT,
-            sentAt: new Date(),
-            nextAttemptAt: null,
-          },
-        });
-      } catch {
-        if (attempt >= MAX_DELIVERY_ATTEMPTS) {
-          await this.prisma.notification.updateMany({
-            where: {
-              id: notificationId,
-              status: NotificationStatus.PENDING,
-            },
-            data: {
-              status: NotificationStatus.FAILED,
+        await NotificationModel.updateOne(
+          { _id: notificationId, status: NotificationStatus.PENDING },
+          {
+            $set: {
+              status: NotificationStatus.SENT,
+              sentAt: new Date(),
               nextAttemptAt: null,
             },
-          });
+          },
+        );
+      } catch {
+        if (attempt >= MAX_DELIVERY_ATTEMPTS) {
+          await NotificationModel.updateOne(
+            { _id: notificationId, status: NotificationStatus.PENDING },
+            {
+              $set: { status: NotificationStatus.FAILED, nextAttemptAt: null },
+            },
+          );
 
           this.logger.error(
             `Notification ${notificationId} failed after ${MAX_DELIVERY_ATTEMPTS} attempts`,
           );
         } else {
-          await this.prisma.notification.updateMany({
-            where: {
-              id: notificationId,
-              status: NotificationStatus.PENDING,
+          await NotificationModel.updateOne(
+            { _id: notificationId, status: NotificationStatus.PENDING },
+            {
+              $set: {
+                nextAttemptAt: new Date(Date.now() + retryDelay(attempt)),
+              },
             },
-            data: {
-              nextAttemptAt: new Date(Date.now() + retryDelay(attempt)),
-            },
-          });
+          );
         }
       }
     } catch {
@@ -245,7 +236,7 @@ export class NotificationsService implements OnApplicationBootstrap {
       totalPages: number;
     };
   }> {
-    const where: Prisma.NotificationWhereInput = { userId };
+    const where: Record<string, unknown> = { userId };
 
     if (query.status) {
       where.status = query.status;
@@ -259,19 +250,17 @@ export class NotificationsService implements OnApplicationBootstrap {
     const limit = query.limit ?? 20;
     const skip = (page - 1) * limit;
 
-    const [data, total] = await this.prisma.$transaction([
-      this.prisma.notification.findMany({
-        where,
-        orderBy: { createdAt: 'desc' },
-        skip,
-        take: limit,
-        select: notificationSelect,
-      }),
-      this.prisma.notification.count({ where }),
+    const [data, total] = await Promise.all([
+      NotificationModel.find(where)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      NotificationModel.countDocuments(where),
     ]);
 
     return {
-      data,
+      data: (data as unknown as NotificationDoc[]).map(toNotificationView),
       meta: {
         page,
         limit,

@@ -5,12 +5,12 @@ import {
   IsInt,
   IsOptional,
   IsString,
-  IsUUID,
   Max,
   MaxLength,
   Min,
 } from 'class-validator';
-import { PaymentStatus } from '../../generated/prisma/enums';
+import { IsObjectIdString } from '../../common/object-id';
+import { PaymentStatus } from '../../database/enums';
 
 export class ListAdminPaymentsQueryDto {
   @ApiPropertyOptional({ default: 1, minimum: 1 })
@@ -33,14 +33,14 @@ export class ListAdminPaymentsQueryDto {
   @IsEnum(PaymentStatus)
   status?: PaymentStatus;
 
-  @ApiPropertyOptional({ format: 'uuid' })
+  @ApiPropertyOptional({ example: '507f1f77bcf86cd799439011' })
   @IsOptional()
-  @IsUUID()
+  @IsObjectIdString()
   orderId?: string;
 
-  @ApiPropertyOptional({ format: 'uuid' })
+  @ApiPropertyOptional({ example: '507f1f77bcf86cd799439011' })
   @IsOptional()
-  @IsUUID()
+  @IsObjectIdString()
   customerId?: string;
 
   @ApiPropertyOptional({ example: 'PAY-ORD-20260101-ABCD1234' })

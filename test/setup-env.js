@@ -5,12 +5,18 @@ const dotenv = require('dotenv');
 const envPath = path.resolve(__dirname, '..', '.env');
 if (fs.existsSync(envPath)) {
   const fileEnv = dotenv.parse(fs.readFileSync(envPath));
-  process.env.DATABASE_URL ||= fileEnv.DATABASE_URL;
+  if (/^mongodb(\+srv)?:\/\//.test(fileEnv.DATABASE_URL ?? '')) {
+    const url = new URL(fileEnv.DATABASE_URL);
+    url.pathname = '/delivery_tracking_test';
+    process.env.DATABASE_URL ||= url.toString();
+  }
   process.env.REDIS_URL ||= fileEnv.REDIS_URL;
 }
 
-process.env.DATABASE_URL ??=
-  'postgresql://postgres:postgres@localhost:5432/delivery_tracking?schema=public';
+if (!/^mongodb(\+srv)?:\/\//.test(process.env.DATABASE_URL ?? '')) {
+  process.env.DATABASE_URL =
+    'mongodb://localhost:27017/delivery_tracking_test?replicaSet=rs0';
+}
 process.env.REDIS_URL ??= 'redis://localhost:6379';
 process.env.JWT_ACCESS_SECRET ??=
   'test-access-secret-at-least-thirty-two-characters';
@@ -24,6 +30,7 @@ process.env.DEFAULT_CURRENCY ??= 'NGN';
 process.env.PAYSTACK_SECRET_KEY ??=
   'sk_test_paystack_secret_key_for_test_suite';
 process.env.PAYSTACK_API_BASE_URL ??= 'https://api.paystack.co';
+process.env.SMTP_HOST = '';
 process.env.LOG_LEVEL ??= 'silent';
 process.env.THROTTLE_LIMIT ??= '10000';
 process.env.AUTH_THROTTLE_LIMIT ??= '10000';

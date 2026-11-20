@@ -2,7 +2,8 @@ import { INestApplication } from '@nestjs/common';
 import { App } from 'supertest/types';
 import request from 'supertest';
 import { Socket, io } from 'socket.io-client';
-import { PrismaService } from '../src/prisma/prisma.service';
+import { OrderStatus, UserRole } from '../src/database/enums';
+import { OrderModel, UserModel } from '../src/database/models';
 import {
   createTestApp,
   registerCustomer,
@@ -23,7 +24,6 @@ interface StatusEvent {
 describe('Socket.IO Redis adapter (e2e)', () => {
   let appA: INestApplication<App>;
   let appB: INestApplication<App>;
-  let prisma: PrismaService;
   let socketUrlB: string;
   let customerSocket: Socket | undefined;
 
@@ -124,9 +124,8 @@ describe('Socket.IO Redis adapter (e2e)', () => {
     const second = await createTestApp();
     appA = first.app;
     appB = second.app;
-    prisma = first.prisma;
 
-    await resetDatabase(prisma);
+    await resetDatabase();
 
     await appA.listen(0);
     await appB.listen(0);
@@ -148,14 +147,14 @@ describe('Socket.IO Redis adapter (e2e)', () => {
       password,
     });
 
-    await prisma.user.update({
-      where: { email: riderEmail },
-      data: { role: 'RIDER' },
-    });
-    await prisma.user.update({
-      where: { email: adminEmail },
-      data: { role: 'ADMIN' },
-    });
+    await UserModel.updateOne(
+      { email: riderEmail },
+      { $set: { role: UserRole.RIDER } },
+    );
+    await UserModel.updateOne(
+      { email: adminEmail },
+      { $set: { role: UserRole.ADMIN } },
+    );
 
     rider = await login(riderEmail);
     admin = await login(adminEmail);
@@ -163,7 +162,7 @@ describe('Socket.IO Redis adapter (e2e)', () => {
 
   afterAll(async () => {
     customerSocket?.disconnect();
-    await resetDatabase(prisma);
+    await resetDatabase();
     await appA.close();
     await appB.close();
   });
@@ -179,10 +178,10 @@ describe('Socket.IO Redis adapter (e2e)', () => {
       })
       .expect(201);
 
-    await prisma.order.update({
-      where: { id: order.body.id as string },
-      data: { status: 'CONFIRMED' },
-    });
+    await OrderModel.updateOne(
+      { _id: order.body.id as string },
+      { $set: { status: OrderStatus.CONFIRMED } },
+    );
 
     const assignment = await apiA()
       .post(`/api/v1/admin/orders/${order.body.id as string}/assign`)

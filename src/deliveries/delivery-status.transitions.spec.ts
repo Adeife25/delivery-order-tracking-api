@@ -1,4 +1,4 @@
-import { DeliveryStatus } from '../generated/prisma/enums';
+import { DeliveryStatus } from '../database/enums';
 import {
   ACTIVE_DELIVERY_STATUSES,
   canTransitionDeliveryStatus,

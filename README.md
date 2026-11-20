@@ -18,27 +18,32 @@ BullMQ notification queue so the API can run as multiple replicas.
 
 - Node.js 22+
 - npm
-- Docker with Docker Compose (PostgreSQL 17 and Redis 7)
+- Docker with Docker Compose (MongoDB 7 replica set and Redis 7)
 
 ## Local setup
 
 ```bash
 npm ci
 Copy-Item .env.example .env
-docker compose up -d postgres redis
-npm run db:generate
-npm run db:migrate:dev
+docker compose up -d mongo mongo-init redis
+npm run db:sync:indexes
 npm run start:dev
 ```
 
 The API listens on `http://localhost:3000`. The health endpoint is
 `GET /api/v1/health`; Swagger UI is available at `/api/docs`. If host port
-`5432` is already in use, set `POSTGRES_HOST_PORT=5433` and update
-`DATABASE_URL` to match before running migrations.
+`27017` is already in use, change the host-side mapping in `docker-compose.yml`
+and update `DATABASE_URL` to match. The Compose MongoDB is a single-node replica
+set named `rs0` (required for transactions) and `mongo-init` initiates it
+automatically; wait until `mongo` is healthy before running the index sync.
+Because the replica set advertises `mongo:27017`, add `127.0.0.1 mongo` to your
+hosts file when running the API on the host with the `localhost` URL from
+`.env.example`; the API container uses `mongodb://mongo:27017/...` internally.
+Alternatively, use `docker compose up -d api` and let Compose handle it.
 
 Set `DATABASE_URL`, `REDIS_URL`, `JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET`, and
 `PAYSTACK_SECRET_KEY` in `.env`; the remaining values in `.env.example` are
-optional. The application validates the PostgreSQL URL, Redis URL, JWT
+optional. The application validates the MongoDB connection URL, Redis URL, JWT
 secrets, ports, token lifetimes, bcrypt rounds, the flat delivery fee/currency,
 and Paystack URLs on startup. `REDIS_URL` is required when `NODE_ENV` is
 `production`; when it is omitted in development the API falls back to
@@ -171,39 +176,46 @@ Redis provides the shared state that horizontal scaling requires:
   transport; if you re-enable HTTP polling, configure sticky sessions at the
   load balancer.
 - **Notifications** use BullMQ workers and a repeatable sweep job. Delivery is
-  idempotent through an atomic PostgreSQL claim, so duplicate jobs send at most
-  once. The PostgreSQL outbox remains the source of truth, so Redis loss never
+  idempotent through an atomic MongoDB claim, so duplicate jobs send at most
+  once. The MongoDB outbox remains the source of truth, so Redis loss never
   loses notifications.
-- **Readiness** (`/api/v1/health/ready`) checks both PostgreSQL and Redis.
+- **Readiness** (`/api/v1/health/ready`) checks both MongoDB and Redis.
 
 Redis must allow `maxmemory-policy noeviction` for BullMQ; the Compose and
 Render configurations set this. Use `rediss://` for managed Redis over TLS.
 `NOTIFICATION_WORKER_CONCURRENCY` controls jobs processed per replica (default
-`5`). As traffic grows, the database becomes the next bottleneck; add PgBouncer
-or a connection pooler and read replicas for read-heavy admin endpoints.
+`5`). As traffic grows, MongoDB becomes the next bottleneck; tune the Mongoose
+connection pool and add read replicas for read-heavy admin endpoints.
 
 ## Deployment
 
-`render.yaml` describes a Render web service, PostgreSQL database, and Redis
-instance. It builds
-with `npm ci --include=dev && npm run db:generate && npm run build`, applies
-migrations before starting, and uses `/api/v1/health/ready` for health checks.
-Set the secrets marked `sync: false` in the Render dashboard:
+`render.yaml` describes a Render web service and Redis instance; MongoDB is
+provided by MongoDB Atlas. It builds with
+`npm ci --include=dev && npm run build` and uses `/api/v1/health/ready` for
+health checks. Set the secrets marked `sync: false` in the Render dashboard:
 
+- `DATABASE_URL` (an Atlas `mongodb+srv://.../delivery_tracking` URI)
 - `JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET` (at least 32 characters each)
 - `PAYSTACK_SECRET_KEY`, `PAYSTACK_CALLBACK_URL`
 - `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`
 
+### MongoDB Atlas production notes
+
+- Use an Atlas M10+ cluster (or any replica set): transactions and the
+  transactional outbox require a replica set, so a standalone MongoDB will not
+  work. Allow the Render egress IPs (or use PrivateLink) and grant the Atlas
+  database user read/write access to `delivery_tracking`.
+- Run `npm run db:sync:indexes` as a release step with `DATABASE_URL` pointed at
+  Atlas. Mongoose models define the indexes; the application does not create
+  them at startup.
+
 Production notes:
 
-- Run migrations as a release step. The included blueprint runs
-  `npm run db:migrate:deploy` at startup for single-instance deployments; use a
-  dedicated migration job or Render pre-deploy command when scaling out.
 - Configure the Paystack webhook URL as
   `https://<your-host>/api/v1/payments/webhook`.
 - Verify `/api/v1/health` and `/api/v1/health/ready` after deployment.
 - The repository is not deployed by CI. CI validates formatting, linting,
-  builds, tests, migrations, and the Docker image only.
+  builds, tests, index sync, and the Docker image only.
 
 ## Useful commands
 
@@ -214,10 +226,7 @@ Production notes:
 | `npm run format:check`      | Check Prettier formatting                |
 | `npm test`                  | Run unit tests                           |
 | `npm run test:e2e`          | Run API end-to-end tests                 |
-| `npm run db:generate`       | Generate the Prisma client               |
-| `npm run db:validate`       | Validate the Prisma schema               |
-| `npm run db:migrate:dev`    | Create and apply a development migration |
-| `npm run db:migrate:deploy` | Apply migrations in deployment           |
+| `npm run db:sync:indexes`   | Create or update MongoDB indexes         |
 
 The project requirements and planned domain behavior are documented in
 [`docs/Technical Specification For Delivery and Order Tracking System.pdf`](docs/Technical%20Specification%20For%20Delivery%20and%20Order%20Tracking%20System.pdf).

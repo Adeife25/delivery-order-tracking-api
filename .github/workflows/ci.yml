@@ -8,22 +8,9 @@ jobs:
   checks:
     runs-on: ubuntu-latest
     env:
-      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/delivery_tracking?schema=public
+      DATABASE_URL: mongodb://localhost:27017/delivery_tracking_test?replicaSet=rs0
       REDIS_URL: redis://localhost:6379
     services:
-      postgres:
-        image: postgres:17-alpine
-        env:
-          POSTGRES_DB: delivery_tracking
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres -d delivery_tracking"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 5
       redis:
         image: redis:7-alpine
         ports:
@@ -39,10 +26,12 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - uses: supercharge/mongodb-github-action@1.12.0
+        with:
+          mongodb-version: '7.0'
+          mongodb-replica-set: rs0
       - run: npm ci
-      - run: npm run db:validate
-      - run: npm run db:generate
-      - run: npm run db:migrate:deploy
+      - run: npm run db:sync:indexes
       - run: npm run format:check
       - run: npm run lint
       - run: npm run build

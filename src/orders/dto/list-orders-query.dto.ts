@@ -1,7 +1,7 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import { IsEnum, IsInt, IsOptional, Max, Min } from 'class-validator';
-import { OrderStatus } from '../../generated/prisma/enums';
+import { OrderStatus } from '../../database/enums';
 
 export class ListOrdersQueryDto {
   @ApiPropertyOptional({ default: 1, minimum: 1 })

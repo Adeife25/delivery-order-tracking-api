@@ -239,15 +239,32 @@ export function validateEnvironment(
   try {
     parsedDatabaseUrl = new URL(databaseUrl);
   } catch {
-    throw new Error('DATABASE_URL must be a valid PostgreSQL connection URL');
+    throw new Error('DATABASE_URL must be a valid MongoDB connection URL');
   }
 
   if (
-    parsedDatabaseUrl.protocol !== 'postgres:' &&
-    parsedDatabaseUrl.protocol !== 'postgresql:'
+    parsedDatabaseUrl.protocol !== 'mongodb:' &&
+    parsedDatabaseUrl.protocol !== 'mongodb+srv:'
   ) {
     throw new Error(
-      'DATABASE_URL must use the postgres or postgresql protocol',
+      'DATABASE_URL must use the mongodb or mongodb+srv protocol',
+    );
+  }
+
+  if (!parsedDatabaseUrl.hostname || parsedDatabaseUrl.hostname.length === 0) {
+    throw new Error('DATABASE_URL must include a MongoDB host');
+  }
+
+  if (!parsedDatabaseUrl.pathname || parsedDatabaseUrl.pathname === '/') {
+    throw new Error('DATABASE_URL must include a MongoDB database name');
+  }
+
+  if (
+    parsedDatabaseUrl.protocol === 'mongodb:' &&
+    !parsedDatabaseUrl.searchParams.has('replicaSet')
+  ) {
+    throw new Error(
+      'DATABASE_URL must include a replicaSet parameter; MongoDB transactions require a replica set',
     );
   }
 

@@ -8,16 +8,17 @@ import {
   WebSocketServer,
   WsException,
 } from '@nestjs/websockets';
-import { isUUID } from 'class-validator';
 import type { Server, Socket } from 'socket.io';
-import { DeliveryStatus, UserRole } from '../generated/prisma/enums';
+import { isObjectIdString } from '../common/object-id';
+import { DeliveryStatus, UserRole } from '../database/enums';
+import { DeliveryModel, UserModel } from '../database/models';
+import type { DeliveryDoc, UserDoc } from '../database/views';
 import { Public } from '../auth/decorators/public.decorator';
 import {
   AccessJwtPayload,
   AuthenticatedUser,
 } from '../auth/types/authenticated-user';
 import { DeliveryView } from '../deliveries/deliveries.select';
-import { PrismaService } from '../prisma/prisma.service';
 import type { TrackingLocation } from './tracking.service';
 
 @Public()
@@ -35,7 +36,6 @@ export class TrackingGateway {
   constructor(
     config: ConfigService,
     private readonly jwtService: JwtService,
-    private readonly prisma: PrismaService,
   ) {
     this.accessSecret = config.getOrThrow<string>('JWT_ACCESS_SECRET');
   }
@@ -55,18 +55,13 @@ export class TrackingGateway {
   ): Promise<{ joined: true; deliveryId: string }> {
     const user = this.getUser(client);
     const deliveryId = this.getDeliveryId(body);
-    const delivery = await this.prisma.delivery.findUnique({
-      where: { id: deliveryId },
-      select: {
-        id: true,
-        riderId: true,
-        order: { select: { customerId: true } },
-      },
-    });
+    const delivery = (await DeliveryModel.findById(deliveryId)
+      .populate('order', 'customerId')
+      .lean()) as unknown as DeliveryDoc | null;
 
     if (
       !delivery ||
-      !this.canView(user, delivery.riderId, delivery.order.customerId)
+      !this.canView(user, delivery.riderId, delivery.order?.customerId ?? '')
     ) {
       throw new WsException('Delivery not found');
     }
@@ -140,17 +135,16 @@ export class TrackingGateway {
       throw new Error('Invalid access token');
     }
 
-    const user = await this.prisma.user.findUnique({
-      where: { id: payload.sub },
-      select: { id: true, email: true, role: true, isActive: true },
-    });
+    const user = (await UserModel.findOne({ _id: payload.sub })
+      .select('_id email role isActive')
+      .lean()) as unknown as UserDoc | null;
 
     if (!user?.isActive) {
       throw new Error('Invalid access token');
     }
 
     socket.data.user = {
-      id: user.id,
+      id: user._id,
       email: user.email,
       role: user.role,
     } satisfies AuthenticatedUser;
@@ -194,7 +188,7 @@ export class TrackingGateway {
 
     const deliveryId = (body as { deliveryId: string }).deliveryId;
 
-    if (!isUUID(deliveryId)) {
+    if (!isObjectIdString(deliveryId)) {
       throw new WsException('Invalid delivery id');
     }
 

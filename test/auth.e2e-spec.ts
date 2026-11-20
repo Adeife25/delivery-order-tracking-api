@@ -1,12 +1,10 @@
 import { INestApplication } from '@nestjs/common';
 import { App } from 'supertest/types';
 import request from 'supertest';
-import { PrismaService } from '../src/prisma/prisma.service';
 import { createTestApp, resetDatabase } from './helpers/test-app';
 
 describe('Auth endpoints (e2e)', () => {
   let app: INestApplication<App>;
-  let prisma: PrismaService;
 
   const credentials = {
     fullName: 'Ada Obi',
@@ -23,12 +21,11 @@ describe('Auth endpoints (e2e)', () => {
   beforeAll(async () => {
     const testApp = await createTestApp();
     app = testApp.app;
-    prisma = testApp.prisma;
-    await resetDatabase(prisma);
+    await resetDatabase();
   });
 
   afterAll(async () => {
-    await resetDatabase(prisma);
+    await resetDatabase();
     await app.close();
   });
 

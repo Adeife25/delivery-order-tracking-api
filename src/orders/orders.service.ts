@@ -5,28 +5,20 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { OrderStatus, Prisma, UserRole } from '../generated/prisma/client';
-import { PrismaService } from '../prisma/prisma.service';
+import {
+  DatabaseService,
+  isDuplicateKeyError,
+} from '../database/database.service';
+import { OrderStatus, UserRole } from '../database/enums';
+import { DeliveryModel, OrderModel } from '../database/models';
+import { OrderDoc, toOrderHistoryView, toOrderView } from '../database/views';
 import { AuthenticatedUser } from '../auth/types/authenticated-user';
 import { NotificationsService } from '../notifications/notifications.service';
 import { CreateOrderDto } from './dto/create-order.dto';
 import { ListOrdersQueryDto } from './dto/list-orders-query.dto';
 import { generateOrderNumber } from './order-number.generator';
-import {
-  OrderHistoryView,
-  orderHistorySelect,
-  orderSelect,
-  OrderView,
-} from './orders.select';
-
-function isUniqueConstraintError(error: unknown): boolean {
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    'code' in error &&
-    (error as { code?: string }).code === 'P2002'
-  );
-}
+import { orderHistoryPopulate, orderPopulate } from './orders.select';
+import { OrderView } from './orders.select';
 
 @Injectable()
 export class OrdersService {
@@ -35,7 +27,7 @@ export class OrdersService {
 
   constructor(
     config: ConfigService,
-    private readonly prisma: PrismaService,
+    private readonly database: DatabaseService,
     private readonly notifications: NotificationsService,
   ) {
     this.defaultDeliveryFee = config.getOrThrow<string>('DEFAULT_DELIVERY_FEE');
@@ -56,34 +48,37 @@ export class OrdersService {
 
     for (let attempt = 0; attempt < 5; attempt += 1) {
       try {
-        const result = await this.prisma.$transaction(async (tx) => {
-          const order = await tx.order.create({
-            data: {
-              orderNumber: generateOrderNumber(),
-              customerId,
-              pickupAddress: dto.pickupAddress,
-              pickupLatitude: dto.pickupLatitude,
-              pickupLongitude: dto.pickupLongitude,
-              deliveryAddress: dto.deliveryAddress,
-              deliveryLatitude: dto.deliveryLatitude,
-              deliveryLongitude: dto.deliveryLongitude,
-              packageDescription: dto.packageDescription,
-              deliveryInstructions: dto.deliveryInstructions,
-              deliveryFee: this.defaultDeliveryFee,
-              currency: this.defaultCurrency,
-              status: OrderStatus.PENDING_PAYMENT,
-            },
-            select: orderSelect,
-          });
+        const result = await this.database.withTransaction(async (session) => {
+          const [created] = await OrderModel.create(
+            [
+              {
+                orderNumber: generateOrderNumber(),
+                customerId,
+                pickupAddress: dto.pickupAddress,
+                pickupLatitude: dto.pickupLatitude ?? null,
+                pickupLongitude: dto.pickupLongitude ?? null,
+                deliveryAddress: dto.deliveryAddress,
+                deliveryLatitude: dto.deliveryLatitude ?? null,
+                deliveryLongitude: dto.deliveryLongitude ?? null,
+                packageDescription: dto.packageDescription,
+                deliveryInstructions: dto.deliveryInstructions ?? null,
+                deliveryFee: this.defaultDeliveryFee,
+                currency: this.defaultCurrency,
+                status: OrderStatus.PENDING_PAYMENT,
+              },
+            ],
+            { session },
+          );
 
+          const order = toOrderView(created.toObject() as unknown as OrderDoc);
           const notificationId = await this.notifications.createInTransaction(
-            tx,
             {
               userId: customerId,
               type: 'ORDER_CREATED',
               title: 'Order created',
               message: `Your order ${order.orderNumber} has been received and is awaiting payment.`,
             },
+            session,
           );
 
           return { order, notificationId };
@@ -93,7 +88,7 @@ export class OrdersService {
 
         return result.order;
       } catch (error) {
-        if (!isUniqueConstraintError(error) || attempt === 4) {
+        if (!isDuplicateKeyError(error) || attempt === 4) {
           throw error;
         }
       }
@@ -103,12 +98,15 @@ export class OrdersService {
   }
 
   async list(user: AuthenticatedUser, query: ListOrdersQueryDto) {
-    const where: Prisma.OrderWhereInput = {};
+    const where: Record<string, unknown> = {};
 
     if (user.role === UserRole.CUSTOMER) {
       where.customerId = user.id;
     } else if (user.role === UserRole.RIDER) {
-      where.delivery = { is: { riderId: user.id } };
+      const orderIds = await DeliveryModel.find({ riderId: user.id }).distinct(
+        'orderId',
+      );
+      where._id = { $in: orderIds };
     }
 
     if (query.status) {
@@ -119,19 +117,18 @@ export class OrdersService {
     const limit = query.limit ?? 20;
     const skip = (page - 1) * limit;
 
-    const [data, total] = await this.prisma.$transaction([
-      this.prisma.order.findMany({
-        where,
-        orderBy: { createdAt: 'desc' },
-        skip,
-        take: limit,
-        select: orderSelect,
-      }),
-      this.prisma.order.count({ where }),
+    const [data, total] = await Promise.all([
+      OrderModel.find(where)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .populate(orderPopulate)
+        .lean(),
+      OrderModel.countDocuments(where),
     ]);
 
     return {
-      data,
+      data: (data as unknown as OrderDoc[]).map(toOrderView),
       meta: {
         page,
         limit,
@@ -142,10 +139,9 @@ export class OrdersService {
   }
 
   async getById(user: AuthenticatedUser, id: string): Promise<OrderView> {
-    const order = await this.prisma.order.findUnique({
-      where: { id },
-      select: orderSelect,
-    });
+    const order = (await OrderModel.findById(id)
+      .populate(orderPopulate)
+      .lean()) as unknown as OrderDoc | null;
 
     if (!order) {
       throw new NotFoundException('Order not found');
@@ -153,14 +149,16 @@ export class OrdersService {
 
     this.assertCanView(user, order.customerId, order.delivery?.riderId);
 
-    return order;
+    return toOrderView(order);
   }
 
   async cancel(user: AuthenticatedUser, id: string): Promise<OrderView> {
-    const order = await this.prisma.order.findUnique({
-      where: { id },
-      select: { id: true, customerId: true, status: true },
-    });
+    const order = (await OrderModel.findById(id)
+      .select('_id customerId status')
+      .lean()) as unknown as Pick<
+      OrderDoc,
+      '_id' | 'customerId' | 'status'
+    > | null;
 
     if (
       !order ||
@@ -175,31 +173,24 @@ export class OrdersService {
       );
     }
 
-    const result = await this.prisma.order.updateMany({
-      where: {
-        id,
-        status: OrderStatus.PENDING_PAYMENT,
-      },
-      data: { status: OrderStatus.CANCELLED },
-    });
+    const result = await OrderModel.updateOne(
+      { _id: id, status: OrderStatus.PENDING_PAYMENT },
+      { $set: { status: OrderStatus.CANCELLED } },
+    );
 
-    if (result.count !== 1) {
+    if (result.modifiedCount !== 1) {
       throw new ConflictException(
         'Only orders pending payment can be cancelled',
       );
     }
 
-    return this.prisma.order.findUniqueOrThrow({
-      where: { id },
-      select: orderSelect,
-    });
+    return this.getById(user, id);
   }
 
   async getHistory(user: AuthenticatedUser, id: string) {
-    const order: OrderHistoryView | null = await this.prisma.order.findUnique({
-      where: { id },
-      select: orderHistorySelect,
-    });
+    const order = (await OrderModel.findById(id)
+      .populate(orderHistoryPopulate)
+      .lean()) as unknown as OrderDoc | null;
 
     if (!order) {
       throw new NotFoundException('Order not found');
@@ -207,23 +198,25 @@ export class OrdersService {
 
     this.assertCanView(user, order.customerId, order.delivery?.riderId);
 
+    const history = toOrderHistoryView(order);
+
     return {
       order: {
-        id: order.id,
-        orderNumber: order.orderNumber,
-        status: order.status,
-        createdAt: order.createdAt,
-        updatedAt: order.updatedAt,
+        id: history.id,
+        orderNumber: history.orderNumber,
+        status: history.status,
+        createdAt: history.createdAt,
+        updatedAt: history.updatedAt,
       },
-      delivery: order.delivery
+      delivery: history.delivery
         ? {
-            id: order.delivery.id,
-            status: order.delivery.status,
-            createdAt: order.delivery.createdAt,
-            updatedAt: order.delivery.updatedAt,
+            id: history.delivery.id,
+            status: history.delivery.status,
+            createdAt: history.delivery.createdAt,
+            updatedAt: history.delivery.updatedAt,
           }
         : null,
-      deliveryHistory: order.delivery?.statusHistory ?? [],
+      deliveryHistory: history.delivery?.statusHistory ?? [],
     };
   }
 

@@ -6,12 +6,12 @@
   HttpCode,
   HttpStatus,
   Param,
-  ParseUUIDPipe,
   Post,
   Req,
   type RawBodyRequest,
   UnauthorizedException,
 } from '@nestjs/common';
+import { ParseObjectIdPipe as ParseUUIDPipe } from '../common/object-id';
 import {
   ApiBearerAuth,
   ApiOkResponse,
@@ -20,7 +20,7 @@ import {
 } from '@nestjs/swagger';
 import type { Request } from 'express';
 import { RateLimit } from '../common/rate-limit.decorator';
-import { UserRole } from '../generated/prisma/enums';
+import { UserRole } from '../database/enums';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { Public } from '../auth/decorators/public.decorator';
 import { Roles } from '../auth/decorators/roles.decorator';

@@ -5,7 +5,7 @@ import {
   ApiOperation,
   ApiTags,
 } from '@nestjs/swagger';
-import { UserRole } from '../generated/prisma/enums';
+import { UserRole } from '../database/enums';
 import { Roles } from '../auth/decorators/roles.decorator';
 import { AdminService } from './admin.service';
 import { ListAdminOrdersQueryDto } from './dto/list-admin-orders-query.dto';

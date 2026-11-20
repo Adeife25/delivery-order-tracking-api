@@ -1,4 +1,4 @@
-import { DeliveryStatus } from '../generated/prisma/enums';
+import { DeliveryStatus } from '../database/enums';
 
 export const TRACKABLE_DELIVERY_STATUSES: readonly DeliveryStatus[] = [
   DeliveryStatus.ACCEPTED,

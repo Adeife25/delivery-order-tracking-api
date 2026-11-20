@@ -1,23 +1,31 @@
 import { jest } from '@jest/globals';
 import { ServiceUnavailableException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
-import { PrismaService } from '../prisma/prisma.service';
 import { RedisService } from '../redis/redis.service';
-import { HealthController } from './health.controller';
+
+const databasePing = jest.fn(async () => undefined);
+const redisEnabled = jest.fn(() => false);
+const redisPing = jest.fn(async () => true);
+
+jest.unstable_mockModule('../database/database.service', () => ({
+  DatabaseService: class {},
+  isDuplicateKeyError: () => false,
+  sessionOptions: () => ({}),
+}));
+
+const { DatabaseService } = await import('../database/database.service');
+const { HealthController } = await import('./health.controller');
 
 describe('HealthController', () => {
-  let controller: HealthController;
-  const queryRaw = jest.fn();
-  const redisEnabled = jest.fn();
-  const redisPing = jest.fn();
+  let controller: InstanceType<typeof HealthController>;
 
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
       controllers: [HealthController],
       providers: [
         {
-          provide: PrismaService,
-          useValue: { $queryRaw: queryRaw },
+          provide: DatabaseService,
+          useValue: { ping: databasePing },
         },
         {
           provide: RedisService,
@@ -26,8 +34,9 @@ describe('HealthController', () => {
       ],
     }).compile();
 
-    controller = module.get<HealthController>(HealthController);
-    queryRaw.mockReset();
+    controller =
+      module.get<InstanceType<typeof HealthController>>(HealthController);
+    databasePing.mockReset().mockResolvedValue(undefined);
     redisEnabled.mockReset().mockReturnValue(false);
     redisPing.mockReset().mockResolvedValue(true);
   });
@@ -37,17 +46,15 @@ describe('HealthController', () => {
   });
 
   it('reports readiness when the database is reachable', async () => {
-    queryRaw.mockResolvedValueOnce([{ '?column?': 1 }]);
-
     await expect(controller.getReadiness()).resolves.toEqual({
       status: 'ok',
       database: 'up',
       redis: 'disabled',
     });
+    expect(databasePing).toHaveBeenCalledTimes(1);
   });
 
   it('reports readiness when Redis is reachable', async () => {
-    queryRaw.mockResolvedValueOnce([{ '?column?': 1 }]);
     redisEnabled.mockReturnValue(true);
 
     await expect(controller.getReadiness()).resolves.toEqual({
@@ -58,7 +65,7 @@ describe('HealthController', () => {
   });
 
   it('reports unavailability when the database check fails', async () => {
-    queryRaw.mockRejectedValueOnce(new Error('connection refused'));
+    databasePing.mockRejectedValueOnce(new Error('connection refused'));
 
     await expect(controller.getReadiness()).rejects.toBeInstanceOf(
       ServiceUnavailableException,
@@ -66,7 +73,6 @@ describe('HealthController', () => {
   });
 
   it('reports unavailability when Redis is unreachable', async () => {
-    queryRaw.mockResolvedValueOnce([{ '?column?': 1 }]);
     redisEnabled.mockReturnValue(true);
     redisPing.mockResolvedValue(false);
 

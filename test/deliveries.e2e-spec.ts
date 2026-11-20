@@ -1,7 +1,13 @@
 import { INestApplication } from '@nestjs/common';
 import { App } from 'supertest/types';
 import request from 'supertest';
-import { PrismaService } from '../src/prisma/prisma.service';
+import { DeliveryStatus, OrderStatus, UserRole } from '../src/database/enums';
+import {
+  DeliveryAssignmentModel,
+  DeliveryStatusHistoryModel,
+  OrderModel,
+  UserModel,
+} from '../src/database/models';
 import {
   createTestApp,
   registerCustomer,
@@ -16,7 +22,6 @@ interface Session {
 
 describe('Delivery endpoints (e2e)', () => {
   let app: INestApplication<App>;
-  let prisma: PrismaService;
 
   const password = 'strong-password-123';
   const customerEmail = 'customer@example.com';
@@ -65,10 +70,10 @@ describe('Delivery endpoints (e2e)', () => {
     const orderId = response.body.id as string;
 
     if (confirmed) {
-      await prisma.order.update({
-        where: { id: orderId },
-        data: { status: 'CONFIRMED' },
-      });
+      await OrderModel.updateOne(
+        { _id: orderId },
+        { $set: { status: OrderStatus.CONFIRMED } },
+      );
     }
 
     return orderId;
@@ -77,8 +82,7 @@ describe('Delivery endpoints (e2e)', () => {
   beforeAll(async () => {
     const testApp = await createTestApp();
     app = testApp.app;
-    prisma = testApp.prisma;
-    await resetDatabase(prisma);
+    await resetDatabase();
 
     customer = await registerCustomer(app, {
       fullName: 'Customer One',
@@ -106,18 +110,18 @@ describe('Delivery endpoints (e2e)', () => {
       password,
     });
 
-    await prisma.user.update({
-      where: { email: riderOneEmail },
-      data: { role: 'RIDER' },
-    });
-    await prisma.user.update({
-      where: { email: riderTwoEmail },
-      data: { role: 'RIDER' },
-    });
-    await prisma.user.update({
-      where: { email: adminEmail },
-      data: { role: 'ADMIN' },
-    });
+    await UserModel.updateOne(
+      { email: riderOneEmail },
+      { $set: { role: UserRole.RIDER } },
+    );
+    await UserModel.updateOne(
+      { email: riderTwoEmail },
+      { $set: { role: UserRole.RIDER } },
+    );
+    await UserModel.updateOne(
+      { email: adminEmail },
+      { $set: { role: UserRole.ADMIN } },
+    );
 
     riderOne = await login(riderOneEmail);
     riderTwo = await login(riderTwoEmail);
@@ -125,7 +129,7 @@ describe('Delivery endpoints (e2e)', () => {
   });
 
   afterAll(async () => {
-    await resetDatabase(prisma);
+    await resetDatabase();
     await app.close();
   });
 
@@ -276,23 +280,27 @@ describe('Delivery endpoints (e2e)', () => {
   });
 
   it('records delivery status history and closes the assignment', async () => {
-    const history = await prisma.deliveryStatusHistory.findMany({
-      where: { deliveryId: deliveryOneId },
-      orderBy: { createdAt: 'asc' },
-    });
+    const history = await DeliveryStatusHistoryModel.find({
+      deliveryId: deliveryOneId,
+    })
+      .sort({ createdAt: 1 })
+      .lean();
 
-    expect(history.map((entry) => entry.newStatus)).toEqual([
-      'ASSIGNED',
-      'ACCEPTED',
-      'PICKED_UP',
-      'IN_TRANSIT',
-      'DELIVERED',
+    expect(
+      history.map((entry: { newStatus: DeliveryStatus }) => entry.newStatus),
+    ).toEqual([
+      DeliveryStatus.ASSIGNED,
+      DeliveryStatus.ACCEPTED,
+      DeliveryStatus.PICKED_UP,
+      DeliveryStatus.IN_TRANSIT,
+      DeliveryStatus.DELIVERED,
     ]);
 
-    const assignment = await prisma.deliveryAssignment.findFirst({
-      where: { deliveryId: deliveryOneId },
-      orderBy: { assignedAt: 'desc' },
-    });
+    const assignment = await DeliveryAssignmentModel.findOne({
+      deliveryId: deliveryOneId,
+    })
+      .sort({ assignedAt: -1 })
+      .lean();
     expect(assignment?.endedAt).not.toBeNull();
   });
 

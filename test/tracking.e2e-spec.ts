@@ -2,7 +2,8 @@ import { INestApplication } from '@nestjs/common';
 import { App } from 'supertest/types';
 import request from 'supertest';
 import { Socket, io } from 'socket.io-client';
-import { PrismaService } from '../src/prisma/prisma.service';
+import { OrderStatus, UserRole } from '../src/database/enums';
+import { OrderModel, UserModel } from '../src/database/models';
 import {
   createTestApp,
   registerCustomer,
@@ -45,7 +46,6 @@ const sleep = (milliseconds: number) =>
 
 describe('Tracking and notifications (e2e)', () => {
   let app: INestApplication<App>;
-  let prisma: PrismaService;
   let socketUrl: string;
 
   const password = 'strong-password-123';
@@ -187,8 +187,7 @@ describe('Tracking and notifications (e2e)', () => {
   beforeAll(async () => {
     const testApp = await createTestApp();
     app = testApp.app;
-    prisma = testApp.prisma;
-    await resetDatabase(prisma);
+    await resetDatabase();
 
     await app.listen(0);
     socketUrl = `http://127.0.0.1:${new URL(await app.getUrl()).port}`;
@@ -219,18 +218,18 @@ describe('Tracking and notifications (e2e)', () => {
       password,
     });
 
-    await prisma.user.update({
-      where: { email: riderOneEmail },
-      data: { role: 'RIDER' },
-    });
-    await prisma.user.update({
-      where: { email: riderTwoEmail },
-      data: { role: 'RIDER' },
-    });
-    await prisma.user.update({
-      where: { email: adminEmail },
-      data: { role: 'ADMIN' },
-    });
+    await UserModel.updateOne(
+      { email: riderOneEmail },
+      { $set: { role: UserRole.RIDER } },
+    );
+    await UserModel.updateOne(
+      { email: riderTwoEmail },
+      { $set: { role: UserRole.RIDER } },
+    );
+    await UserModel.updateOne(
+      { email: adminEmail },
+      { $set: { role: UserRole.ADMIN } },
+    );
 
     riderOne = await login(riderOneEmail);
     riderTwo = await login(riderTwoEmail);
@@ -241,7 +240,7 @@ describe('Tracking and notifications (e2e)', () => {
     customerSocket?.disconnect();
     riderTwoSocket?.disconnect();
     otherSocket?.disconnect();
-    await resetDatabase(prisma);
+    await resetDatabase();
     await app.close();
   });
 
@@ -267,10 +266,10 @@ describe('Tracking and notifications (e2e)', () => {
   });
 
   it('assigns a rider and notifies the rider and customer', async () => {
-    await prisma.order.update({
-      where: { id: orderId },
-      data: { status: 'CONFIRMED' },
-    });
+    await OrderModel.updateOne(
+      { _id: orderId },
+      { $set: { status: OrderStatus.CONFIRMED } },
+    );
 
     const response = await api()
       .post(`/api/v1/admin/orders/${orderId}/assign`)

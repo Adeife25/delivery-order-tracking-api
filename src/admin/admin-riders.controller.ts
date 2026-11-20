@@ -1,11 +1,12 @@
-import { Controller, Get, Param, ParseUUIDPipe, Query } from '@nestjs/common';
+import { Controller, Get, Param, Query } from '@nestjs/common';
+import { ParseObjectIdPipe as ParseUUIDPipe } from '../common/object-id';
+import { UserRole } from '../database/enums';
 import {
   ApiBearerAuth,
   ApiOkResponse,
   ApiOperation,
   ApiTags,
 } from '@nestjs/swagger';
-import { UserRole } from '../generated/prisma/enums';
 import { Roles } from '../auth/decorators/roles.decorator';
 import { AdminService } from './admin.service';
 import { ListRidersQueryDto } from './dto/list-riders-query.dto';

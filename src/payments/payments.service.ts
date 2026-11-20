@@ -7,18 +7,15 @@ import {
   ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
-import { randomUUID } from 'crypto';
-import {
-  OrderStatus,
-  PaymentStatus,
-  Prisma,
-  UserRole,
-} from '../generated/prisma/client';
+import { randomUUID } from 'node:crypto';
+import { DatabaseService } from '../database/database.service';
+import { OrderStatus, PaymentStatus, UserRole } from '../database/enums';
+import { OrderModel, PaymentModel, UserModel } from '../database/models';
+import { OrderDoc, PaymentDoc } from '../database/views';
 import { AuthenticatedUser } from '../auth/types/authenticated-user';
 import { NotificationsService } from '../notifications/notifications.service';
-import { PrismaService } from '../prisma/prisma.service';
 import { VerifyPaymentDto } from './dto/verify-payment.dto';
-import { PaymentView, paymentSelect } from './payments.select';
+import { PaymentView, paymentPopulate } from './payments.select';
 import { PaystackClient } from './paystack.client';
 
 export interface PaymentInitiationView {
@@ -29,7 +26,7 @@ export interface PaymentInitiationView {
 }
 
 interface PaymentAmount {
-  amount: Prisma.Decimal | string;
+  amount: string;
   currency: string;
 }
 
@@ -38,7 +35,7 @@ interface ProviderAmount {
   currency: string;
 }
 
-export function toMinorUnits(amount: Prisma.Decimal | string): number {
+export function toMinorUnits(amount: string): number {
   const raw = amount.toString();
   const match = /^(\d+)(?:\.(\d{1,2}))?$/.exec(raw);
 
@@ -58,21 +55,10 @@ function parsePaidAt(value: string | null | undefined): Date {
   return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
 }
 
-function isRetryableTransactionError(error: unknown): boolean {
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    'code' in error &&
-    (error as { code?: string }).code === 'P2034'
-  );
-}
-
-type TransactionClient = Prisma.TransactionClient;
-
 @Injectable()
 export class PaymentsService {
   constructor(
-    private readonly prisma: PrismaService,
+    private readonly database: DatabaseService,
     private readonly paystack: PaystackClient,
     private readonly notifications: NotificationsService,
   ) {}
@@ -87,60 +73,61 @@ export class PaymentsService {
       );
     }
 
-    const { order, payment, reference } = await this.serializable(
-      async (tx) => {
-        const order = await tx.order.findUnique({
-          where: { id: orderId },
-          select: {
-            id: true,
-            orderNumber: true,
-            customerId: true,
-            deliveryFee: true,
-            currency: true,
-            status: true,
-            customer: { select: { email: true } },
-          },
-        });
+    const initiated = await this.database.withTransaction(async (session) => {
+      const order = (await OrderModel.findOne({ _id: orderId }, null, {
+        session,
+      }).lean()) as unknown as OrderDoc | null;
 
-        if (
-          !order ||
-          (user.role !== UserRole.ADMIN && order.customerId !== user.id)
-        ) {
-          throw new NotFoundException('Order not found');
-        }
+      if (
+        !order ||
+        (user.role !== UserRole.ADMIN && order.customerId !== user.id)
+      ) {
+        throw new NotFoundException('Order not found');
+      }
 
-        if (order.status === OrderStatus.CANCELLED) {
-          throw new ConflictException('Order has been cancelled');
-        }
+      if (order.status === OrderStatus.CANCELLED) {
+        throw new ConflictException('Order has been cancelled');
+      }
 
-        if (order.status !== OrderStatus.PENDING_PAYMENT) {
-          throw new ConflictException('Order is not awaiting payment');
-        }
+      if (order.status !== OrderStatus.PENDING_PAYMENT) {
+        throw new ConflictException('Order is not awaiting payment');
+      }
 
-        const existing = await tx.payment.findFirst({
-          where: {
-            orderId,
-            status: {
-              in: [PaymentStatus.PENDING, PaymentStatus.SUCCEEDED],
-            },
-          },
-          orderBy: { createdAt: 'desc' },
-          select: { id: true, status: true },
-        });
+      const existing = (await PaymentModel.findOne(
+        {
+          orderId,
+          status: { $in: [PaymentStatus.PENDING, PaymentStatus.SUCCEEDED] },
+        },
+        null,
+        { session },
+      )
+        .sort({ createdAt: -1 })
+        .lean()) as unknown as PaymentDoc | null;
 
-        if (existing?.status === PaymentStatus.SUCCEEDED) {
-          throw new ConflictException('Order has already been paid');
-        }
+      if (existing?.status === PaymentStatus.SUCCEEDED) {
+        throw new ConflictException('Order has already been paid');
+      }
 
-        if (existing) {
-          throw new ConflictException(
-            'A payment is already pending for this order',
-          );
-        }
+      if (existing) {
+        throw new ConflictException(
+          'A payment is already pending for this order',
+        );
+      }
 
-        const reference = this.generateReference(order.orderNumber);
-        const payment = await tx.payment.create({
-          data: {
+      const customer = await UserModel.findOne(
+        { _id: order.customerId },
+        null,
+        { session },
+      ).lean();
+
+      if (!customer?.email) {
+        throw new NotFoundException('Customer not found');
+      }
+
+      const reference = this.generateReference(order.orderNumber);
+      const [payment] = await PaymentModel.create(
+        [
+          {
             orderId,
             provider: 'paystack',
             providerReference: reference,
@@ -148,37 +135,44 @@ export class PaymentsService {
             currency: order.currency,
             status: PaymentStatus.PENDING,
           },
-          select: paymentSelect,
-        });
+        ],
+        { session },
+      );
 
-        return { order, payment, reference };
-      },
-    );
+      return {
+        paymentId: payment._id.toString(),
+        customerEmail: customer.email as string,
+        amount: order.deliveryFee,
+        currency: order.currency,
+        reference,
+        orderNumber: order.orderNumber,
+      };
+    });
 
     try {
       const initialized = await this.paystack.initialize({
-        email: order.customer.email,
-        amount: toMinorUnits(order.deliveryFee),
-        currency: order.currency,
-        reference,
+        email: initiated.customerEmail,
+        amount: toMinorUnits(initiated.amount),
+        currency: initiated.currency,
+        reference: initiated.reference,
         metadata: {
           orderId,
-          orderNumber: order.orderNumber,
-          paymentId: payment.id,
+          orderNumber: initiated.orderNumber,
+          paymentId: initiated.paymentId,
         },
       });
 
       return {
-        payment,
+        payment: await this.getPaymentById(initiated.paymentId),
         authorizationUrl: initialized.authorization_url,
         accessCode: initialized.access_code,
         reference: initialized.reference,
       };
     } catch {
-      await this.prisma.payment.updateMany({
-        where: { id: payment.id, status: PaymentStatus.PENDING },
-        data: { status: PaymentStatus.FAILED },
-      });
+      await PaymentModel.updateMany(
+        { _id: initiated.paymentId, status: PaymentStatus.PENDING },
+        { $set: { status: PaymentStatus.FAILED } },
+      );
 
       throw new BadGatewayException(
         'Unable to initiate payment with the provider',
@@ -187,17 +181,8 @@ export class PaymentsService {
   }
 
   async getById(user: AuthenticatedUser, id: string): Promise<PaymentView> {
-    const payment = await this.prisma.payment.findUnique({
-      where: { id },
-      select: paymentSelect,
-    });
-
-    if (!payment) {
-      throw new NotFoundException('Payment not found');
-    }
-
+    const payment = await this.getPaymentById(id);
     this.assertCanView(user, payment.order.customerId);
-
     return payment;
   }
 
@@ -291,15 +276,11 @@ export class PaymentsService {
       return { received: true };
     }
 
-    const payment = await this.prisma.payment.findUnique({
-      where: { providerReference: reference },
-      select: {
-        id: true,
-        orderId: true,
-        amount: true,
-        currency: true,
-      },
-    });
+    const payment = (await PaymentModel.findOne({
+      providerReference: reference,
+    })
+      .select('_id orderId amount currency')
+      .lean()) as unknown as PaymentDoc | null;
 
     if (!payment) {
       return { received: true };
@@ -312,35 +293,66 @@ export class PaymentsService {
       });
 
       await this.markSucceeded(
-        payment.id,
+        payment._id,
         payment.orderId,
         typeof data.paid_at === 'string' ? data.paid_at : null,
       );
     } else if (['charge.failed', 'charge.abandoned'].includes(event.event)) {
-      await this.markFailed(payment.id);
+      await this.markFailed(payment._id);
     }
 
     return { received: true };
   }
 
   private async findByReference(reference: string): Promise<PaymentView> {
-    const payment = await this.prisma.payment.findUnique({
-      where: { providerReference: reference },
-      select: paymentSelect,
-    });
+    const payment = (await PaymentModel.findOne({
+      providerReference: reference,
+    })
+      .populate(paymentPopulate)
+      .lean()) as unknown as PaymentDoc | null;
 
     if (!payment) {
       throw new NotFoundException('Payment not found');
     }
 
-    return payment;
+    return this.toView(payment);
   }
 
-  private getPaymentById(id: string): Promise<PaymentView> {
-    return this.prisma.payment.findUniqueOrThrow({
-      where: { id },
-      select: paymentSelect,
-    });
+  private async getPaymentById(id: string): Promise<PaymentView> {
+    const payment = (await PaymentModel.findById(id)
+      .populate(paymentPopulate)
+      .lean()) as unknown as PaymentDoc | null;
+
+    if (!payment) {
+      throw new NotFoundException('Payment not found');
+    }
+
+    return this.toView(payment);
+  }
+
+  private toView(payment: PaymentDoc): PaymentView {
+    if (!payment.order) {
+      throw new NotFoundException('Payment order was not found');
+    }
+
+    return {
+      id: payment._id,
+      orderId: payment.orderId,
+      provider: payment.provider ?? null,
+      providerReference: payment.providerReference ?? null,
+      amount: payment.amount,
+      currency: payment.currency,
+      status: payment.status,
+      paidAt: payment.paidAt ?? null,
+      createdAt: payment.createdAt,
+      updatedAt: payment.updatedAt,
+      order: {
+        id: payment.order._id,
+        orderNumber: payment.order.orderNumber,
+        customerId: payment.order.customerId,
+        status: payment.order.status,
+      },
+    };
   }
 
   private async markSucceeded(
@@ -348,56 +360,60 @@ export class PaymentsService {
     orderId: string,
     paidAt: string | null | undefined,
   ): Promise<PaymentView> {
-    const result = await this.prisma.$transaction(async (tx) => {
-      const updated = await tx.payment.updateMany({
-        where: { id: paymentId, status: { not: PaymentStatus.SUCCEEDED } },
-        data: {
-          provider: 'paystack',
-          status: PaymentStatus.SUCCEEDED,
-          paidAt: parsePaidAt(paidAt),
-        },
-      });
-
-      if (updated.count === 1) {
-        await tx.order.updateMany({
-          where: {
-            id: orderId,
-            status: OrderStatus.PENDING_PAYMENT,
+    const result = await this.database.withTransaction(async (session) => {
+      const updated = await PaymentModel.updateOne(
+        { _id: paymentId, status: { $ne: PaymentStatus.SUCCEEDED } },
+        {
+          $set: {
+            provider: 'paystack',
+            status: PaymentStatus.SUCCEEDED,
+            paidAt: parsePaidAt(paidAt),
           },
-          data: { status: OrderStatus.CONFIRMED },
-        });
-      }
+        },
+        { session },
+      );
 
-      const payment = await tx.payment.findUniqueOrThrow({
-        where: { id: paymentId },
-        select: paymentSelect,
-      });
+      let notificationId: string | undefined;
 
-      const notificationId =
-        updated.count === 1
-          ? await this.notifications.createInTransaction(tx, {
-              userId: payment.order.customerId,
+      if (updated.modifiedCount === 1) {
+        await OrderModel.updateOne(
+          { _id: orderId, status: OrderStatus.PENDING_PAYMENT },
+          { $set: { status: OrderStatus.CONFIRMED } },
+          { session },
+        );
+
+        const order = (await OrderModel.findOne({ _id: orderId }, null, {
+          session,
+        }).lean()) as unknown as OrderDoc | null;
+
+        if (order) {
+          notificationId = await this.notifications.createInTransaction(
+            {
+              userId: order.customerId,
               type: 'PAYMENT_SUCCEEDED',
               title: 'Payment confirmed',
-              message: `Payment for order ${payment.order.orderNumber} was confirmed. A rider can now be assigned.`,
-            })
-          : undefined;
+              message: `Payment for order ${order.orderNumber} was confirmed. A rider can now be assigned.`,
+            },
+            session,
+          );
+        }
+      }
 
-      return { payment, notificationId };
+      return { notificationId };
     });
 
     if (result.notificationId) {
       void this.notifications.enqueue([result.notificationId]);
     }
 
-    return result.payment;
+    return this.getPaymentById(paymentId);
   }
 
   private async markFailed(paymentId: string): Promise<void> {
-    await this.prisma.payment.updateMany({
-      where: { id: paymentId, status: PaymentStatus.PENDING },
-      data: { status: PaymentStatus.FAILED },
-    });
+    await PaymentModel.updateMany(
+      { _id: paymentId, status: PaymentStatus.PENDING },
+      { $set: { status: PaymentStatus.FAILED } },
+    );
   }
 
   private assertProviderMatches(
@@ -428,23 +444,5 @@ export class PaymentsService {
   private generateReference(orderNumber: string): string {
     const normalized = orderNumber.replace(/[^A-Za-z0-9]/g, '');
     return `PAY-${normalized}-${randomUUID().slice(0, 8).toUpperCase()}`;
-  }
-
-  private async serializable<T>(
-    operation: (tx: TransactionClient) => Promise<T>,
-  ): Promise<T> {
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      try {
-        return await this.prisma.$transaction(operation, {
-          isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
-        });
-      } catch (error) {
-        if (!isRetryableTransactionError(error) || attempt === 2) {
-          throw error;
-        }
-      }
-    }
-
-    throw new ConflictException('Could not complete the operation');
   }
 }

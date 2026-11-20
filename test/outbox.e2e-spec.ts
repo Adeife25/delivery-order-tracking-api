@@ -2,8 +2,8 @@ import { jest } from '@jest/globals';
 import { INestApplication } from '@nestjs/common';
 import { App } from 'supertest/types';
 import request from 'supertest';
+import { OrderModel } from '../src/database/models';
 import { NotificationsService } from '../src/notifications/notifications.service';
-import { PrismaService } from '../src/prisma/prisma.service';
 import {
   createTestApp,
   registerCustomer,
@@ -17,7 +17,6 @@ interface Session {
 
 describe('Transactional notification outbox (e2e)', () => {
   let app: INestApplication<App>;
-  let prisma: PrismaService;
   let customer: Session;
 
   const password = 'strong-password-123';
@@ -25,8 +24,7 @@ describe('Transactional notification outbox (e2e)', () => {
   beforeAll(async () => {
     const testApp = await createTestApp();
     app = testApp.app;
-    prisma = testApp.prisma;
-    await resetDatabase(prisma);
+    await resetDatabase();
 
     customer = await registerCustomer(app, {
       fullName: 'Outbox Customer',
@@ -36,7 +34,7 @@ describe('Transactional notification outbox (e2e)', () => {
   });
 
   afterAll(async () => {
-    await resetDatabase(prisma);
+    await resetDatabase();
     await app.close();
   });
 
@@ -57,7 +55,7 @@ describe('Transactional notification outbox (e2e)', () => {
         })
         .expect(500);
 
-      await expect(prisma.order.count()).resolves.toBe(0);
+      await expect(OrderModel.countDocuments()).resolves.toBe(0);
     } finally {
       failure.mockRestore();
     }

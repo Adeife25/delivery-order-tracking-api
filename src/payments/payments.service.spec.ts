@@ -1,4 +1,20 @@
-import { toMinorUnits } from './payments.service';
+import { jest } from '@jest/globals';
+
+jest.unstable_mockModule('../database/database.service', () => ({
+  DatabaseService: class {},
+  isDuplicateKeyError: () => false,
+  sessionOptions: () => ({}),
+}));
+jest.unstable_mockModule('../database/models', () => ({
+  OrderModel: {},
+  PaymentModel: {},
+  UserModel: {},
+}));
+jest.unstable_mockModule('../notifications/notifications.service', () => ({
+  NotificationsService: class {},
+}));
+
+const { toMinorUnits } = await import('./payments.service');
 
 describe('toMinorUnits', () => {
   it('converts decimal amounts to provider minor units', () => {

@@ -1,7 +1,14 @@
 import { INestApplication } from '@nestjs/common';
 import { App } from 'supertest/types';
 import request from 'supertest';
-import { PrismaService } from '../src/prisma/prisma.service';
+import { DeliveryStatus, PaymentStatus, UserRole } from '../src/database/enums';
+import {
+  DeliveryAssignmentModel,
+  DeliveryModel,
+  OrderModel,
+  PaymentModel,
+  UserModel,
+} from '../src/database/models';
 import {
   createTestApp,
   registerCustomer,
@@ -16,7 +23,6 @@ interface Session {
 
 describe('Admin analytics and rider performance (e2e)', () => {
   let app: INestApplication<App>;
-  let prisma: PrismaService;
 
   const password = 'strong-password-123';
   const customerEmail = 'admin-customer@example.com';
@@ -52,25 +58,22 @@ describe('Admin analytics and rider performance (e2e)', () => {
     orderNumber: string,
     status: 'CONFIRMED' | 'PENDING_PAYMENT' | 'CANCELLED',
   ) {
-    return prisma.order.create({
-      data: {
-        orderNumber,
-        customerId: customer.user.id,
-        pickupAddress: '12 Marina Road, Lagos',
-        deliveryAddress: '45 Adeola Odeku Street, Lagos',
-        packageDescription: 'Small sealed carton',
-        deliveryFee: '1500.00',
-        currency: 'NGN',
-        status,
-      },
+    return OrderModel.create({
+      orderNumber,
+      customerId: customer.user.id,
+      pickupAddress: '12 Marina Road, Lagos',
+      deliveryAddress: '45 Adeola Odeku Street, Lagos',
+      packageDescription: 'Small sealed carton',
+      deliveryFee: '1500.00',
+      currency: 'NGN',
+      status,
     });
   }
 
   beforeAll(async () => {
     const testApp = await createTestApp();
     app = testApp.app;
-    prisma = testApp.prisma;
-    await resetDatabase(prisma);
+    await resetDatabase();
 
     customer = await registerCustomer(app, {
       fullName: 'Admin Analytics Customer',
@@ -93,18 +96,18 @@ describe('Admin analytics and rider performance (e2e)', () => {
       password,
     });
 
-    await prisma.user.update({
-      where: { email: riderOneEmail },
-      data: { role: 'RIDER' },
-    });
-    await prisma.user.update({
-      where: { email: riderTwoEmail },
-      data: { role: 'RIDER', isActive: false },
-    });
-    await prisma.user.update({
-      where: { email: adminEmail },
-      data: { role: 'ADMIN' },
-    });
+    await UserModel.updateOne(
+      { email: riderOneEmail },
+      { $set: { role: UserRole.RIDER } },
+    );
+    await UserModel.updateOne(
+      { email: riderTwoEmail },
+      { $set: { role: UserRole.RIDER, isActive: false } },
+    );
+    await UserModel.updateOne(
+      { email: adminEmail },
+      { $set: { role: UserRole.ADMIN } },
+    );
 
     riderOne = await login(riderOneEmail);
     admin = await login(adminEmail);
@@ -119,111 +122,97 @@ describe('Admin analytics and rider performance (e2e)', () => {
     await createOrder('ORD-ADMIN-0005', 'PENDING_PAYMENT');
     await createOrder('ORD-ADMIN-0006', 'CANCELLED');
 
-    const deliveredOne = await prisma.delivery.create({
-      data: {
-        orderId: orderOne.id,
+    const deliveredOne = await DeliveryModel.create({
+      orderId: String(orderOne._id),
+      riderId: riderOne.user.id,
+      status: DeliveryStatus.DELIVERED,
+      assignedAt: at(0),
+      acceptedAt: at(2),
+      pickedUpAt: at(5),
+      deliveredAt: at(25),
+    });
+    riderOneDeliveredId = String(deliveredOne._id);
+
+    const failedOne = await DeliveryModel.create({
+      orderId: String(orderTwo._id),
+      riderId: riderOne.user.id,
+      status: DeliveryStatus.FAILED,
+      assignedAt: at(60),
+      acceptedAt: at(61),
+      pickedUpAt: at(63),
+      failureReason: 'Customer unavailable',
+    });
+
+    const activeOne = await DeliveryModel.create({
+      orderId: String(orderThree._id),
+      riderId: riderOne.user.id,
+      status: DeliveryStatus.IN_TRANSIT,
+      assignedAt: at(120),
+      acceptedAt: at(122),
+      pickedUpAt: at(125),
+    });
+
+    const deliveredTwo = await DeliveryModel.create({
+      orderId: String(orderFour._id),
+      riderId: riderTwo.user.id,
+      status: DeliveryStatus.DELIVERED,
+      assignedAt: at(240),
+      acceptedAt: at(244),
+      pickedUpAt: at(250),
+      deliveredAt: at(280),
+    });
+
+    await DeliveryAssignmentModel.insertMany([
+      {
+        deliveryId: String(deliveredOne._id),
         riderId: riderOne.user.id,
-        status: 'DELIVERED',
+        assignedById: admin.user.id,
         assignedAt: at(0),
-        acceptedAt: at(2),
-        pickedUpAt: at(5),
-        deliveredAt: at(25),
+        endedAt: at(25),
       },
-    });
-    riderOneDeliveredId = deliveredOne.id;
-
-    const failedOne = await prisma.delivery.create({
-      data: {
-        orderId: orderTwo.id,
+      {
+        deliveryId: String(failedOne._id),
         riderId: riderOne.user.id,
-        status: 'FAILED',
+        assignedById: admin.user.id,
         assignedAt: at(60),
-        acceptedAt: at(61),
-        pickedUpAt: at(63),
-        failureReason: 'Customer unavailable',
+        endedAt: at(65),
       },
-    });
-
-    const activeOne = await prisma.delivery.create({
-      data: {
-        orderId: orderThree.id,
+      {
+        deliveryId: String(activeOne._id),
         riderId: riderOne.user.id,
-        status: 'IN_TRANSIT',
+        assignedById: admin.user.id,
         assignedAt: at(120),
-        acceptedAt: at(122),
-        pickedUpAt: at(125),
       },
-    });
-
-    const deliveredTwo = await prisma.delivery.create({
-      data: {
-        orderId: orderFour.id,
+      {
+        deliveryId: String(deliveredTwo._id),
         riderId: riderTwo.user.id,
-        status: 'DELIVERED',
+        assignedById: admin.user.id,
         assignedAt: at(240),
-        acceptedAt: at(244),
-        pickedUpAt: at(250),
-        deliveredAt: at(280),
+        endedAt: at(280),
       },
-    });
+    ]);
 
-    await prisma.deliveryAssignment.createMany({
-      data: [
-        {
-          deliveryId: deliveredOne.id,
-          riderId: riderOne.user.id,
-          assignedById: admin.user.id,
-          assignedAt: at(0),
-          endedAt: at(25),
-        },
-        {
-          deliveryId: failedOne.id,
-          riderId: riderOne.user.id,
-          assignedById: admin.user.id,
-          assignedAt: at(60),
-          endedAt: at(65),
-        },
-        {
-          deliveryId: activeOne.id,
-          riderId: riderOne.user.id,
-          assignedById: admin.user.id,
-          assignedAt: at(120),
-        },
-        {
-          deliveryId: deliveredTwo.id,
-          riderId: riderTwo.user.id,
-          assignedById: admin.user.id,
-          assignedAt: at(240),
-          endedAt: at(280),
-        },
-      ],
+    await PaymentModel.create({
+      orderId: String(orderTwo._id),
+      provider: 'paystack',
+      providerReference: 'ADMIN-PAY-SUCCESS',
+      amount: '1500.00',
+      currency: 'NGN',
+      status: PaymentStatus.SUCCEEDED,
+      paidAt: new Date(Date.now() - 60 * 60 * 1000),
     });
-
-    await prisma.payment.create({
-      data: {
-        orderId: orderTwo.id,
-        provider: 'paystack',
-        providerReference: 'ADMIN-PAY-SUCCESS',
-        amount: '1500.00',
-        currency: 'NGN',
-        status: 'SUCCEEDED',
-        paidAt: new Date(Date.now() - 60 * 60 * 1000),
-      },
-    });
-    await prisma.payment.create({
-      data: {
-        orderId: orderThree.id,
-        provider: 'paystack',
-        providerReference: 'ADMIN-PAY-FAILED',
-        amount: '1500.00',
-        currency: 'NGN',
-        status: 'FAILED',
-      },
+    await PaymentModel.create({
+      orderId: String(orderThree._id),
+      provider: 'paystack',
+      providerReference: 'ADMIN-PAY-FAILED',
+      amount: '1500.00',
+      currency: 'NGN',
+      status: PaymentStatus.FAILED,
     });
   });
 
   afterAll(async () => {
-    await resetDatabase(prisma);
+    await resetDatabase();
     await app.close();
   });
 
@@ -381,9 +370,7 @@ describe('Admin analytics and rider performance (e2e)', () => {
     ).toContain(riderOneDeliveredId);
 
     await api()
-      .get(
-        '/api/v1/admin/riders/11111111-1111-4111-8111-111111111111/performance',
-      )
+      .get('/api/v1/admin/riders/64b7f9d2e1a2b3c4d5e6f708/performance')
       .set(auth(admin))
       .expect(404);
 

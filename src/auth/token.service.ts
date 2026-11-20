@@ -2,7 +2,8 @@ import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { createHash, randomUUID } from 'node:crypto';
-import { PrismaService } from '../prisma/prisma.service';
+import { RefreshTokenModel } from '../database/models';
+import type { RefreshTokenDoc } from '../database/views';
 import {
   RefreshJwtPayload,
   TokenPair,
@@ -12,6 +13,8 @@ import {
 function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
 }
+
+export type ActiveRefreshToken = RefreshTokenDoc;
 
 @Injectable()
 export class TokenService {
@@ -23,7 +26,6 @@ export class TokenService {
   constructor(
     config: ConfigService,
     private readonly jwtService: JwtService,
-    private readonly prisma: PrismaService,
   ) {
     this.accessSecret = config.getOrThrow<string>('JWT_ACCESS_SECRET');
     this.refreshSecret = config.getOrThrow<string>('JWT_REFRESH_SECRET');
@@ -60,12 +62,10 @@ export class TokenService {
       ),
     ]);
 
-    await this.prisma.refreshToken.create({
-      data: {
-        userId: user.id,
-        tokenHash: hashToken(refreshToken),
-        expiresAt: new Date(Date.now() + this.refreshTtlSeconds * 1000),
-      },
+    await RefreshTokenModel.create({
+      userId: user.id,
+      tokenHash: hashToken(refreshToken),
+      expiresAt: new Date(Date.now() + this.refreshTtlSeconds * 1000),
     });
 
     return {
@@ -92,22 +92,20 @@ export class TokenService {
     }
   }
 
-  findActiveRefreshToken(token: string) {
-    return this.prisma.refreshToken.findUnique({
-      where: { tokenHash: hashToken(token) },
-      include: { user: true },
-    });
+  async findActiveRefreshToken(
+    token: string,
+  ): Promise<ActiveRefreshToken | null> {
+    return (await RefreshTokenModel.findOne({ tokenHash: hashToken(token) })
+      .populate('user')
+      .lean()) as unknown as ActiveRefreshToken | null;
   }
 
   async revokeRefreshToken(token: string): Promise<number> {
-    const result = await this.prisma.refreshToken.updateMany({
-      where: {
-        tokenHash: hashToken(token),
-        revokedAt: null,
-      },
-      data: { revokedAt: new Date() },
-    });
+    const result = await RefreshTokenModel.updateMany(
+      { tokenHash: hashToken(token), revokedAt: null },
+      { $set: { revokedAt: new Date() } },
+    );
 
-    return result.count;
+    return result.modifiedCount;
   }
 }

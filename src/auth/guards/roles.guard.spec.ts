@@ -5,7 +5,7 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
-import { UserRole } from '../../generated/prisma/enums';
+import { UserRole } from '../../database/enums';
 import { RolesGuard } from './roles.guard';
 
 describe('RolesGuard', () => {

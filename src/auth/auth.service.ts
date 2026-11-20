@@ -5,19 +5,25 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as bcrypt from 'bcrypt';
+import { isDuplicateKeyError } from '../database/database.service';
+import type { UserDoc } from '../database/views';
 import { UsersService } from '../users/users.service';
 import { toPublicUser } from '../users/users.select';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 import { TokenService } from './token.service';
+import type { TokenSubject } from './types/authenticated-user';
 
 function isUniqueConstraintError(error: unknown): boolean {
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    'code' in error &&
-    (error as { code?: string }).code === 'P2002'
-  );
+  return isDuplicateKeyError(error);
+}
+
+function toTokenSubject(user: UserDoc): TokenSubject {
+  return {
+    id: user._id,
+    email: user.email,
+    role: user.role,
+  };
 }
 
 @Injectable()
@@ -74,7 +80,7 @@ export class AuthService {
       throw new UnauthorizedException('Invalid email or password');
     }
 
-    const tokens = await this.tokenService.issueTokenPair(user);
+    const tokens = await this.tokenService.issueTokenPair(toTokenSubject(user));
 
     return {
       ...tokens,
@@ -90,7 +96,7 @@ export class AuthService {
       !stored ||
       stored.userId !== payload.sub ||
       stored.expiresAt <= new Date() ||
-      !stored.user.isActive
+      !stored.user?.isActive
     ) {
       throw new UnauthorizedException('Invalid refresh token');
     }
@@ -101,11 +107,12 @@ export class AuthService {
       throw new UnauthorizedException('Refresh token has already been used');
     }
 
-    const tokens = await this.tokenService.issueTokenPair(stored.user);
+    const user = stored.user as UserDoc;
+    const tokens = await this.tokenService.issueTokenPair(toTokenSubject(user));
 
     return {
       ...tokens,
-      user: toPublicUser(stored.user),
+      user: toPublicUser(user),
     };
   }
 

@@ -1,7 +1,8 @@
 import { INestApplication } from '@nestjs/common';
 import { App } from 'supertest/types';
 import request from 'supertest';
-import { PrismaService } from '../src/prisma/prisma.service';
+import { UserRole } from '../src/database/enums';
+import { UserModel } from '../src/database/models';
 import {
   createTestApp,
   registerCustomer,
@@ -16,7 +17,6 @@ interface Session {
 
 describe('Orders endpoints (e2e)', () => {
   let app: INestApplication<App>;
-  let prisma: PrismaService;
 
   const password = 'strong-password-123';
   const customerEmail = 'customer@example.com';
@@ -47,8 +47,7 @@ describe('Orders endpoints (e2e)', () => {
   beforeAll(async () => {
     const testApp = await createTestApp();
     app = testApp.app;
-    prisma = testApp.prisma;
-    await resetDatabase(prisma);
+    await resetDatabase();
 
     customer = await registerCustomer(app, {
       fullName: 'Customer One',
@@ -65,10 +64,10 @@ describe('Orders endpoints (e2e)', () => {
       email: adminEmail,
       password,
     });
-    await prisma.user.update({
-      where: { email: adminEmail },
-      data: { role: 'ADMIN' },
-    });
+    await UserModel.updateOne(
+      { email: adminEmail },
+      { $set: { role: UserRole.ADMIN } },
+    );
 
     const adminLogin = await api()
       .post('/api/v1/auth/login')
@@ -78,7 +77,7 @@ describe('Orders endpoints (e2e)', () => {
   });
 
   afterAll(async () => {
-    await resetDatabase(prisma);
+    await resetDatabase();
     await app.close();
   });
 
@@ -234,9 +233,8 @@ describe('Orders endpoints (e2e)', () => {
   });
 
   it('restricts riders to assigned orders', async () => {
-    await prisma.user.update({
-      where: { id: other.user.id },
-      data: { role: 'RIDER' },
+    await UserModel.findByIdAndUpdate(other.user.id, {
+      $set: { role: UserRole.RIDER },
     });
 
     await api()

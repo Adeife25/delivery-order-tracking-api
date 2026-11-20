@@ -3,61 +3,55 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import type { ClientSession } from 'mongoose';
+import { DatabaseService } from '../database/database.service';
+import { DeliveryStatus, OrderStatus, UserRole } from '../database/enums';
 import {
-  DeliveryStatus,
-  OrderStatus,
-  Prisma,
-  UserRole,
-} from '../generated/prisma/client';
+  DeliveryAssignmentModel,
+  DeliveryModel,
+  DeliveryStatusHistoryModel,
+  OrderModel,
+  UserModel,
+} from '../database/models';
+import { deliveryPopulate } from '../database/populate';
+import { DeliveryDoc, OrderDoc, toDeliveryView } from '../database/views';
 import { AuditService } from '../audit/audit.service';
 import { AuthenticatedUser } from '../auth/types/authenticated-user';
 import {
   NotificationsService,
   type CreateNotificationInput,
 } from '../notifications/notifications.service';
-import { PrismaService } from '../prisma/prisma.service';
 import { TrackingGateway } from '../tracking/tracking.gateway';
 import {
   ACTIVE_DELIVERY_STATUSES,
   REASSIGNABLE_DELIVERY_STATUSES,
   RIDER_FAILABLE_STATUSES,
 } from './delivery-status.transitions';
-import { DeliveryView, deliverySelect } from './deliveries.select';
+import { DeliveryView } from './deliveries.select';
 import { FailDeliveryDto } from './dto/fail-delivery.dto';
 import { ListDeliveriesQueryDto } from './dto/list-deliveries-query.dto';
 
-type TransactionClient = Prisma.TransactionClient;
-
 interface TransitionResult {
-  delivery: DeliveryView;
+  deliveryId: string;
   notificationId?: string;
 }
 
 interface AssignmentResult {
-  delivery: DeliveryView;
+  deliveryId: string;
   notificationIds: string[];
-}
-
-function isRetryableTransactionError(error: unknown): boolean {
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    'code' in error &&
-    (error as { code?: string }).code === 'P2034'
-  );
 }
 
 @Injectable()
 export class DeliveriesService {
   constructor(
-    private readonly prisma: PrismaService,
+    private readonly database: DatabaseService,
     private readonly notifications: NotificationsService,
     private readonly tracking: TrackingGateway,
     private readonly audit: AuditService,
   ) {}
 
   async listAssigned(user: AuthenticatedUser, query: ListDeliveriesQueryDto) {
-    const where: Prisma.DeliveryWhereInput = { riderId: user.id };
+    const where: Record<string, unknown> = { riderId: user.id };
 
     if (query.status) {
       where.status = query.status;
@@ -67,19 +61,18 @@ export class DeliveriesService {
     const limit = query.limit ?? 20;
     const skip = (page - 1) * limit;
 
-    const [data, total] = await this.prisma.$transaction([
-      this.prisma.delivery.findMany({
-        where,
-        orderBy: { createdAt: 'desc' },
-        skip,
-        take: limit,
-        select: deliverySelect,
-      }),
-      this.prisma.delivery.count({ where }),
+    const [data, total] = await Promise.all([
+      DeliveryModel.find(where)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .populate(deliveryPopulate)
+        .lean(),
+      DeliveryModel.countDocuments(where),
     ]);
 
     return {
-      data,
+      data: (data as unknown as DeliveryDoc[]).map(toDeliveryView),
       meta: {
         page,
         limit,
@@ -90,17 +83,8 @@ export class DeliveriesService {
   }
 
   async getById(user: AuthenticatedUser, id: string): Promise<DeliveryView> {
-    const delivery = await this.prisma.delivery.findUnique({
-      where: { id },
-      select: deliverySelect,
-    });
-
-    if (!delivery) {
-      throw new NotFoundException('Delivery not found');
-    }
-
+    const delivery = await this.getDeliveryView(id);
     this.assertCanView(user, delivery.riderId, delivery.order.customerId);
-
     return delivery;
   }
 
@@ -119,11 +103,10 @@ export class DeliveriesService {
   }
 
   async reject(user: AuthenticatedUser, id: string): Promise<DeliveryView> {
-    const result = await this.prisma.$transaction(async (tx) => {
-      const delivery = await tx.delivery.findUnique({
-        where: { id },
-        select: { id: true, riderId: true, status: true },
-      });
+    const result = await this.database.withTransaction(async (session) => {
+      const delivery = (await DeliveryModel.findOne({ _id: id }, null, {
+        session,
+      }).lean()) as unknown as DeliveryDoc | null;
 
       if (!delivery || delivery.riderId !== user.id) {
         throw new NotFoundException('Delivery not found');
@@ -136,57 +119,58 @@ export class DeliveriesService {
       }
 
       const now = new Date();
-      const result = await tx.delivery.updateMany({
-        where: {
-          id,
+      const result = await DeliveryModel.updateOne(
+        {
+          _id: id,
           riderId: user.id,
           status: DeliveryStatus.ASSIGNED,
         },
-        data: {
-          riderId: null,
-          status: DeliveryStatus.PENDING_ASSIGNMENT,
-          assignedAt: null,
-          acceptedAt: null,
-          pickedUpAt: null,
-          deliveredAt: null,
-          failureReason: null,
+        {
+          $set: {
+            riderId: null,
+            status: DeliveryStatus.PENDING_ASSIGNMENT,
+            assignedAt: null,
+            acceptedAt: null,
+            pickedUpAt: null,
+            deliveredAt: null,
+            failureReason: null,
+          },
         },
-      });
+        { session },
+      );
 
-      if (result.count !== 1) {
+      if (result.modifiedCount !== 1) {
         throw new ConflictException(
           'Only an assigned delivery can be rejected',
         );
       }
 
-      const updated = await tx.delivery.findUniqueOrThrow({
-        where: { id },
-        select: deliverySelect,
-      });
+      await DeliveryStatusHistoryModel.create(
+        [
+          {
+            deliveryId: id,
+            previousStatus: DeliveryStatus.ASSIGNED,
+            newStatus: DeliveryStatus.PENDING_ASSIGNMENT,
+            changedById: user.id,
+          },
+        ],
+        { session },
+      );
 
-      await tx.deliveryStatusHistory.create({
-        data: {
-          deliveryId: id,
-          previousStatus: DeliveryStatus.ASSIGNED,
-          newStatus: DeliveryStatus.PENDING_ASSIGNMENT,
-          changedById: user.id,
-        },
-      });
+      await DeliveryAssignmentModel.updateMany(
+        { deliveryId: id, endedAt: null },
+        { $set: { endedAt: now } },
+        { session },
+      );
 
-      await tx.deliveryAssignment.updateMany({
-        where: { deliveryId: id, endedAt: null },
-        data: { endedAt: now },
-      });
+      const notificationId = await this.statusNotificationInTransaction(
+        id,
+        DeliveryStatus.PENDING_ASSIGNMENT,
+        user.id,
+        session,
+      );
 
-      const notification = this.statusNotification(updated);
-      const notificationId = notification
-        ? await this.notifications.createInTransaction(tx, {
-            userId: updated.order.customerId,
-            ...notification,
-          })
-        : undefined;
-
-      return { delivery: updated, notificationId };
+      return { deliveryId: id, notificationId };
     });
 
     return this.afterStatusChange(result);
@@ -258,11 +242,10 @@ export class DeliveriesService {
     orderId: string,
     riderId: string,
   ): Promise<DeliveryView> {
-    const result = await this.serializable(async (tx) => {
-      const order = await tx.order.findUnique({
-        where: { id: orderId },
-        select: { id: true, status: true },
-      });
+    const result = await this.database.withTransaction(async (session) => {
+      const order = (await OrderModel.findOne({ _id: orderId }, null, {
+        session,
+      }).lean()) as unknown as OrderDoc | null;
 
       if (!order) {
         throw new NotFoundException('Order not found');
@@ -278,76 +261,85 @@ export class DeliveriesService {
         );
       }
 
-      await this.getAssignableRider(tx, riderId);
+      await this.getAssignableRider(session, riderId);
 
-      const existing = await tx.delivery.findUnique({
-        where: { orderId },
-        select: { id: true, riderId: true, status: true },
-      });
+      const existing = (await DeliveryModel.findOne({ orderId }, null, {
+        session,
+      }).lean()) as unknown as DeliveryDoc | null;
 
       if (existing && existing.status !== DeliveryStatus.PENDING_ASSIGNMENT) {
         throw new ConflictException('Delivery is not awaiting assignment');
       }
 
-      await this.assertRiderAvailable(tx, riderId, existing?.id);
+      await this.assertRiderAvailable(session, riderId, existing?._id);
 
       const now = new Date();
-      let delivery: DeliveryView;
+      let deliveryId: string;
 
       if (existing) {
-        delivery = await tx.delivery.update({
-          where: { id: existing.id },
-          data: {
-            riderId,
-            status: DeliveryStatus.ASSIGNED,
-            assignedAt: now,
-            acceptedAt: null,
-            pickedUpAt: null,
-            deliveredAt: null,
-            failureReason: null,
+        await DeliveryModel.updateOne(
+          { _id: existing._id },
+          {
+            $set: {
+              riderId,
+              status: DeliveryStatus.ASSIGNED,
+              assignedAt: now,
+              acceptedAt: null,
+              pickedUpAt: null,
+              deliveredAt: null,
+              failureReason: null,
+            },
           },
-          select: deliverySelect,
-        });
+          { session },
+        );
+        deliveryId = existing._id;
       } else {
-        delivery = await tx.delivery.create({
-          data: {
-            orderId,
-            riderId,
-            status: DeliveryStatus.ASSIGNED,
-            assignedAt: now,
-          },
-          select: deliverySelect,
-        });
+        const [created] = await DeliveryModel.create(
+          [
+            {
+              orderId,
+              riderId,
+              status: DeliveryStatus.ASSIGNED,
+              assignedAt: now,
+            },
+          ],
+          { session },
+        );
+        deliveryId = created._id.toString();
       }
 
-      await tx.deliveryStatusHistory.create({
-        data: {
-          deliveryId: delivery.id,
-          previousStatus: DeliveryStatus.PENDING_ASSIGNMENT,
-          newStatus: DeliveryStatus.ASSIGNED,
-          changedById: admin.id,
-        },
-      });
+      await DeliveryStatusHistoryModel.create(
+        [
+          {
+            deliveryId,
+            previousStatus: DeliveryStatus.PENDING_ASSIGNMENT,
+            newStatus: DeliveryStatus.ASSIGNED,
+            changedById: admin.id,
+          },
+        ],
+        { session },
+      );
 
-      await tx.deliveryAssignment.create({
-        data: {
-          deliveryId: delivery.id,
-          riderId,
-          assignedById: admin.id,
-        },
-      });
+      await DeliveryAssignmentModel.create(
+        [{ deliveryId, riderId, assignedById: admin.id }],
+        { session },
+      );
 
       const notificationIds: string[] = [];
-      for (const input of this.assignmentNotifications(delivery)) {
+      for (const input of await this.assignmentNotificationInputs(
+        orderId,
+        riderId,
+        session,
+      )) {
         notificationIds.push(
-          await this.notifications.createInTransaction(tx, input),
+          await this.notifications.createInTransaction(input, session),
         );
       }
 
-      return { delivery, notificationIds };
+      return { deliveryId, notificationIds };
     });
 
-    const delivery = this.afterAssignment(result);
+    const delivery = await this.afterAssignment(result);
 
     this.audit.record({
       action: 'DELIVERY_ASSIGNED',
@@ -368,22 +360,20 @@ export class DeliveriesService {
     deliveryId: string,
     riderId: string,
   ): Promise<DeliveryView> {
-    const result = await this.serializable(async (tx) => {
-      const delivery = await tx.delivery.findUnique({
-        where: { id: deliveryId },
-        select: {
-          id: true,
-          riderId: true,
-          status: true,
-          order: { select: { status: true } },
-        },
-      });
+    const result = await this.database.withTransaction(async (session) => {
+      const delivery = (await DeliveryModel.findOne({ _id: deliveryId }, null, {
+        session,
+      }).lean()) as unknown as DeliveryDoc | null;
 
       if (!delivery) {
         throw new NotFoundException('Delivery not found');
       }
 
-      if (delivery.order.status === OrderStatus.CANCELLED) {
+      const order = (await OrderModel.findOne({ _id: delivery.orderId }, null, {
+        session,
+      }).lean()) as unknown as OrderDoc | null;
+
+      if (order?.status === OrderStatus.CANCELLED) {
         throw new ConflictException('Order has been cancelled');
       }
 
@@ -399,60 +389,67 @@ export class DeliveriesService {
         );
       }
 
-      await this.getAssignableRider(tx, riderId);
-      await this.assertRiderAvailable(tx, riderId, delivery.id);
+      await this.getAssignableRider(session, riderId);
+      await this.assertRiderAvailable(session, riderId, deliveryId);
 
       const now = new Date();
 
-      await tx.deliveryAssignment.updateMany({
-        where: { deliveryId, endedAt: null },
-        data: { endedAt: now },
-      });
+      await DeliveryAssignmentModel.updateMany(
+        { deliveryId, endedAt: null },
+        { $set: { endedAt: now } },
+        { session },
+      );
 
-      const updated = await tx.delivery.update({
-        where: { id: deliveryId },
-        data: {
-          riderId,
-          status: DeliveryStatus.ASSIGNED,
-          assignedAt: now,
-          acceptedAt: null,
-          pickedUpAt: null,
-          deliveredAt: null,
-          failureReason: null,
+      await DeliveryModel.updateOne(
+        { _id: deliveryId },
+        {
+          $set: {
+            riderId,
+            status: DeliveryStatus.ASSIGNED,
+            assignedAt: now,
+            acceptedAt: null,
+            pickedUpAt: null,
+            deliveredAt: null,
+            failureReason: null,
+          },
         },
-        select: deliverySelect,
-      });
+        { session },
+      );
 
       if (delivery.status !== DeliveryStatus.ASSIGNED) {
-        await tx.deliveryStatusHistory.create({
-          data: {
-            deliveryId,
-            previousStatus: delivery.status,
-            newStatus: DeliveryStatus.ASSIGNED,
-            changedById: admin.id,
-          },
-        });
-      }
-
-      await tx.deliveryAssignment.create({
-        data: {
-          deliveryId,
-          riderId,
-          assignedById: admin.id,
-        },
-      });
-
-      const notificationIds: string[] = [];
-      for (const input of this.assignmentNotifications(updated)) {
-        notificationIds.push(
-          await this.notifications.createInTransaction(tx, input),
+        await DeliveryStatusHistoryModel.create(
+          [
+            {
+              deliveryId,
+              previousStatus: delivery.status,
+              newStatus: DeliveryStatus.ASSIGNED,
+              changedById: admin.id,
+            },
+          ],
+          { session },
         );
       }
 
-      return { delivery: updated, notificationIds };
+      await DeliveryAssignmentModel.create(
+        [{ deliveryId, riderId, assignedById: admin.id }],
+        { session },
+      );
+
+      const notificationIds: string[] = [];
+      for (const input of await this.assignmentNotificationInputs(
+        delivery.orderId,
+        riderId,
+        session,
+      )) {
+        notificationIds.push(
+          await this.notifications.createInTransaction(input, session),
+        );
+      }
+
+      return { deliveryId, notificationIds };
     });
 
-    const delivery = this.afterAssignment(result);
+    const delivery = await this.afterAssignment(result);
 
     this.audit.record({
       action: 'DELIVERY_REASSIGNED',
@@ -474,15 +471,14 @@ export class DeliveriesService {
     allowedFrom: readonly DeliveryStatus[],
     options: {
       nextStatus: DeliveryStatus;
-      data?: (now: Date) => Prisma.DeliveryUpdateInput;
+      data?: (now: Date) => Record<string, unknown>;
       endAssignments?: boolean;
     },
   ): Promise<TransitionResult> {
-    return this.prisma.$transaction(async (tx) => {
-      const delivery = await tx.delivery.findUnique({
-        where: { id: deliveryId },
-        select: { id: true, riderId: true, status: true },
-      });
+    return this.database.withTransaction(async (session) => {
+      const delivery = (await DeliveryModel.findOne({ _id: deliveryId }, null, {
+        session,
+      }).lean()) as unknown as DeliveryDoc | null;
 
       if (!delivery || delivery.riderId !== user.id) {
         throw new NotFoundException('Delivery not found');
@@ -495,160 +491,221 @@ export class DeliveriesService {
       }
 
       const now = new Date();
-      const result = await tx.delivery.updateMany({
-        where: {
-          id: deliveryId,
+      const result = await DeliveryModel.updateOne(
+        {
+          _id: deliveryId,
           riderId: user.id,
           status: delivery.status,
         },
-        data: {
-          status: options.nextStatus,
-          ...options.data?.(now),
+        {
+          $set: {
+            status: options.nextStatus,
+            ...options.data?.(now),
+          },
         },
-      });
+        { session },
+      );
 
-      if (result.count !== 1) {
+      if (result.modifiedCount !== 1) {
         throw new ConflictException(
           `Delivery cannot move from ${delivery.status} to ${options.nextStatus}`,
         );
       }
 
-      const updated = await tx.delivery.findUniqueOrThrow({
-        where: { id: deliveryId },
-        select: deliverySelect,
-      });
-
-      await tx.deliveryStatusHistory.create({
-        data: {
-          deliveryId,
-          previousStatus: delivery.status,
-          newStatus: options.nextStatus,
-          changedById: user.id,
-        },
-      });
+      await DeliveryStatusHistoryModel.create(
+        [
+          {
+            deliveryId,
+            previousStatus: delivery.status,
+            newStatus: options.nextStatus,
+            changedById: user.id,
+          },
+        ],
+        { session },
+      );
 
       if (options.endAssignments) {
-        await tx.deliveryAssignment.updateMany({
-          where: { deliveryId, endedAt: null },
-          data: { endedAt: now },
-        });
+        await DeliveryAssignmentModel.updateMany(
+          { deliveryId, endedAt: null },
+          { $set: { endedAt: now } },
+          { session },
+        );
       }
 
-      const notification = this.statusNotification(updated);
-      const notificationId = notification
-        ? await this.notifications.createInTransaction(tx, {
-            userId: updated.order.customerId,
-            ...notification,
-          })
-        : undefined;
+      const notificationId = await this.statusNotificationInTransaction(
+        deliveryId,
+        options.nextStatus,
+        user.id,
+        session,
+      );
 
-      return { delivery: updated, notificationId };
+      return { deliveryId, notificationId };
     });
   }
 
-  private assignmentNotifications(
-    delivery: DeliveryView,
-  ): CreateNotificationInput[] {
+  private async statusNotificationInTransaction(
+    deliveryId: string,
+    status: DeliveryStatus,
+    changedById: string,
+    session: ClientSession,
+  ): Promise<string | undefined> {
+    const notification = this.statusNotificationForStatus(status);
+    if (!notification) {
+      return undefined;
+    }
+
+    const delivery = (await DeliveryModel.findOne({ _id: deliveryId }, null, {
+      session,
+    }).lean()) as unknown as DeliveryDoc | null;
+    const order = delivery
+      ? ((await OrderModel.findOne({ _id: delivery.orderId }, null, {
+          session,
+        }).lean()) as unknown as OrderDoc | null)
+      : null;
+
+    if (!order) {
+      return undefined;
+    }
+
+    return this.notifications.createInTransaction(
+      {
+        userId: order.customerId,
+        ...notification,
+      },
+      session,
+    );
+  }
+
+  private async assignmentNotificationInputs(
+    orderId: string,
+    riderId: string,
+    session: ClientSession,
+  ): Promise<CreateNotificationInput[]> {
+    const order = (await OrderModel.findOne({ _id: orderId }, null, {
+      session,
+    }).lean()) as unknown as OrderDoc | null;
+    const rider = (await UserModel.findOne({ _id: riderId }, null, {
+      session,
+    }).lean()) as unknown as { fullName: string } | null;
+
+    if (!order) {
+      return [];
+    }
+
     const notifications: CreateNotificationInput[] = [];
 
-    if (delivery.riderId) {
+    if (rider) {
       notifications.push({
-        userId: delivery.riderId,
+        userId: riderId,
         type: 'DELIVERY_ASSIGNED',
         title: 'New delivery assigned',
-        message: `Delivery ${delivery.order.orderNumber} from ${delivery.order.pickupAddress} to ${delivery.order.deliveryAddress} has been assigned to you.`,
+        message: `Delivery ${order.orderNumber} from ${order.pickupAddress} to ${order.deliveryAddress} has been assigned to you.`,
       });
     }
 
     notifications.push({
-      userId: delivery.order.customerId,
+      userId: order.customerId,
       type: 'RIDER_ASSIGNED',
       title: 'Rider assigned',
-      message: `Rider ${delivery.rider?.fullName ?? delivery.riderId ?? 'unknown'} has been assigned to order ${delivery.order.orderNumber}.`,
+      message: `Rider ${rider?.fullName ?? riderId} has been assigned to order ${order.orderNumber}.`,
     });
 
     return notifications;
   }
 
-  private afterAssignment(result: AssignmentResult): DeliveryView {
-    this.tracking.emitDeliveryAssigned(result.delivery);
-
-    if (result.notificationIds.length > 0) {
-      void this.notifications.enqueue(result.notificationIds);
-    }
-
-    return result.delivery;
-  }
-
-  private afterStatusChange(result: TransitionResult): DeliveryView {
-    this.tracking.emitStatusUpdated(result.delivery);
-
-    if (result.notificationId) {
-      void this.notifications.enqueue([result.notificationId]);
-    }
-
-    return result.delivery;
-  }
-
-  private statusNotification(
-    delivery: DeliveryView,
+  private statusNotificationForStatus(
+    status: DeliveryStatus,
   ): Omit<CreateNotificationInput, 'userId'> | null {
-    const orderNumber = delivery.order.orderNumber;
-
-    switch (delivery.status) {
+    switch (status) {
       case DeliveryStatus.ACCEPTED:
         return {
           type: 'DELIVERY_ACCEPTED',
           title: 'Rider accepted delivery',
-          message: `The rider accepted delivery ${orderNumber}.`,
+          message: 'The rider accepted your delivery.',
         };
       case DeliveryStatus.PICKED_UP:
         return {
           type: 'DELIVERY_PICKED_UP',
           title: 'Package picked up',
-          message: `The package for delivery ${orderNumber} has been picked up.`,
+          message: 'The package for your delivery has been picked up.',
         };
       case DeliveryStatus.IN_TRANSIT:
         return {
           type: 'DELIVERY_IN_TRANSIT',
           title: 'Delivery in transit',
-          message: `Delivery ${orderNumber} is now in transit.`,
+          message: 'Your delivery is now in transit.',
         };
       case DeliveryStatus.DELIVERED:
         return {
           type: 'DELIVERY_COMPLETED',
           title: 'Delivery completed',
-          message: `Delivery ${orderNumber} has been completed.`,
+          message: 'Your delivery has been completed.',
         };
       case DeliveryStatus.FAILED:
         return {
           type: 'DELIVERY_FAILED',
           title: 'Delivery failed',
-          message: `Delivery ${orderNumber} failed${delivery.failureReason ? `: ${delivery.failureReason}` : ''}.`,
+          message: 'Your delivery has failed.',
         };
       case DeliveryStatus.PENDING_ASSIGNMENT:
         return {
           type: 'DELIVERY_REJECTED',
           title: 'Delivery awaiting reassignment',
-          message: `The rider declined delivery ${orderNumber}. It is awaiting reassignment.`,
+          message:
+            'The rider declined your delivery. It is awaiting reassignment.',
         };
       default:
         return null;
     }
   }
 
+  private async getDeliveryView(id: string): Promise<DeliveryView> {
+    const delivery = (await DeliveryModel.findById(id)
+      .populate(deliveryPopulate)
+      .lean()) as unknown as DeliveryDoc | null;
+
+    if (!delivery) {
+      throw new NotFoundException('Delivery not found');
+    }
+
+    return toDeliveryView(delivery);
+  }
+
+  private async afterAssignment(
+    result: AssignmentResult,
+  ): Promise<DeliveryView> {
+    const delivery = await this.getDeliveryView(result.deliveryId);
+    this.tracking.emitDeliveryAssigned(delivery);
+
+    if (result.notificationIds.length > 0) {
+      void this.notifications.enqueue(result.notificationIds);
+    }
+
+    return delivery;
+  }
+
+  private async afterStatusChange(
+    result: TransitionResult,
+  ): Promise<DeliveryView> {
+    const delivery = await this.getDeliveryView(result.deliveryId);
+    this.tracking.emitStatusUpdated(delivery);
+
+    if (result.notificationId) {
+      void this.notifications.enqueue([result.notificationId]);
+    }
+
+    return delivery;
+  }
+
   private async getAssignableRider(
-    tx: TransactionClient,
+    session: ClientSession,
     riderId: string,
   ): Promise<void> {
-    const rider = await tx.user.findFirst({
-      where: {
-        id: riderId,
-        role: UserRole.RIDER,
-        isActive: true,
-      },
-      select: { id: true },
-    });
+    const rider = await UserModel.findOne(
+      { _id: riderId, role: UserRole.RIDER, isActive: true },
+      null,
+      { session },
+    ).lean();
 
     if (!rider) {
       throw new NotFoundException('Rider not found');
@@ -656,18 +713,19 @@ export class DeliveriesService {
   }
 
   private async assertRiderAvailable(
-    tx: TransactionClient,
+    session: ClientSession,
     riderId: string,
     excludedDeliveryId?: string,
   ): Promise<void> {
-    const active = await tx.delivery.findFirst({
-      where: {
+    const active = await DeliveryModel.findOne(
+      {
         riderId,
-        status: { in: [...ACTIVE_DELIVERY_STATUSES] },
-        ...(excludedDeliveryId && { id: { not: excludedDeliveryId } }),
+        status: { $in: [...ACTIVE_DELIVERY_STATUSES] },
+        ...(excludedDeliveryId && { _id: { $ne: excludedDeliveryId } }),
       },
-      select: { id: true },
-    });
+      null,
+      { session },
+    ).lean();
 
     if (active) {
       throw new ConflictException('Rider already has an active delivery');
@@ -692,23 +750,5 @@ export class DeliveriesService {
     }
 
     throw new NotFoundException('Delivery not found');
-  }
-
-  private async serializable<T>(
-    operation: (tx: TransactionClient) => Promise<T>,
-  ): Promise<T> {
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      try {
-        return await this.prisma.$transaction(operation, {
-          isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
-        });
-      } catch (error) {
-        if (!isRetryableTransactionError(error) || attempt === 2) {
-          throw error;
-        }
-      }
-    }
-
-    throw new ConflictException('Could not complete the operation');
   }
 }

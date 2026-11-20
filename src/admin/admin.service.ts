@@ -4,19 +4,34 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { DatabaseService } from '../database/database.service';
 import {
   DeliveryStatus,
   OrderStatus,
   PaymentStatus,
-  Prisma,
   UserRole,
-} from '../generated/prisma/client';
+} from '../database/enums';
+import {
+  DeliveryAssignmentModel,
+  DeliveryModel,
+  OrderModel,
+  PaymentModel,
+  RefreshTokenModel,
+  UserModel,
+} from '../database/models';
+import { orderPopulate, paymentPopulate } from '../database/populate';
+import {
+  DeliveryDoc,
+  OrderDoc,
+  PaymentDoc,
+  PublicUser,
+  UserDoc,
+  toOrderView,
+  toPublicUser,
+} from '../database/views';
 import { AuditService } from '../audit/audit.service';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user';
-import { orderSelect } from '../orders/orders.select';
-import { paymentSelect } from '../payments/payments.select';
-import { PrismaService } from '../prisma/prisma.service';
-import { publicUserSelect } from '../users/users.select';
+import { USER_PUBLIC_FIELDS } from '../database/populate';
 import { ListAdminOrdersQueryDto } from './dto/list-admin-orders-query.dto';
 import { ListAdminPaymentsQueryDto } from './dto/list-admin-payments-query.dto';
 import { ListCustomersQueryDto } from './dto/list-customers-query.dto';
@@ -34,39 +49,18 @@ const ACTIVE_DELIVERY_STATUSES: DeliveryStatus[] = [
   DeliveryStatus.IN_TRANSIT,
 ];
 
-const riderDeliveryMetricSelect = {
-  status: true,
-  assignedAt: true,
-  acceptedAt: true,
-  pickedUpAt: true,
-  deliveredAt: true,
-} satisfies Prisma.DeliverySelect;
+const RIDER_DELIVERY_METRIC_FIELDS =
+  'status assignedAt acceptedAt pickedUpAt deliveredAt';
+const RIDER_RECENT_DELIVERY_ORDER_FIELDS =
+  '_id orderNumber pickupAddress deliveryAddress deliveryFee currency status';
 
-const riderRecentDeliverySelect = {
-  id: true,
-  status: true,
-  assignedAt: true,
-  acceptedAt: true,
-  pickedUpAt: true,
-  deliveredAt: true,
-  failureReason: true,
-  createdAt: true,
-  order: {
-    select: {
-      id: true,
-      orderNumber: true,
-      pickupAddress: true,
-      deliveryAddress: true,
-      deliveryFee: true,
-      currency: true,
-      status: true,
-    },
-  },
-} satisfies Prisma.DeliverySelect;
-
-type RiderDeliveryMetric = Prisma.DeliveryGetPayload<{
-  select: typeof riderDeliveryMetricSelect;
-}>;
+export interface RiderDeliveryMetric {
+  status: DeliveryStatus;
+  assignedAt: Date | null;
+  acceptedAt: Date | null;
+  pickedUpAt: Date | null;
+  deliveredAt: Date | null;
+}
 
 export interface RiderMetrics {
   totalAssignments: number;
@@ -154,94 +148,75 @@ export function calculateRiderMetrics(
 }
 
 function groupCount<T extends string>(
-  groups: Array<{ status: T; _count: { _all: number } }>,
+  groups: Array<{ status: T; count: number }>,
   status: T,
 ): number {
-  return groups.find((group) => group.status === status)?._count._all ?? 0;
+  return groups.find((group) => group.status === status)?.count ?? 0;
+}
+
+async function countByStatus<T extends string>(
+  rowsPromise: Promise<Array<{ _id: T; count: number }>>,
+  statuses: readonly T[],
+): Promise<Array<{ status: T; count: number }>> {
+  const rows = await rowsPromise;
+  const counts = new Map(rows.map((row) => [row._id, row.count]));
+
+  return statuses.map((status) => ({ status, count: counts.get(status) ?? 0 }));
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function sumAmounts(payments: Array<{ amount: string; currency: string }>) {
+  const byCurrency = new Map<string, number>();
+
+  for (const payment of payments) {
+    const amount = Number(payment.amount);
+    byCurrency.set(
+      payment.currency,
+      (byCurrency.get(payment.currency) ?? 0) + amount,
+    );
+  }
+
+  return [...byCurrency.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([currency, amount]) => ({ currency, amount: amount.toFixed(2) }));
 }
 
 @Injectable()
 export class AdminService {
   constructor(
-    private readonly prisma: PrismaService,
+    private readonly database: DatabaseService,
     private readonly audit: AuditService,
   ) {}
 
   async listRiders(query: ListRidersQueryDto) {
-    const where: Prisma.UserWhereInput = { role: UserRole.RIDER };
-
-    if (query.isActive !== undefined) {
-      where.isActive = query.isActive;
-    }
-
-    const page = query.page ?? 1;
-    const limit = query.limit ?? 20;
-    const skip = (page - 1) * limit;
-
-    const [data, total] = await this.prisma.$transaction([
-      this.prisma.user.findMany({
-        where,
-        orderBy: { createdAt: 'desc' },
-        skip,
-        take: limit,
-        select: publicUserSelect,
-      }),
-      this.prisma.user.count({ where }),
-    ]);
-
-    return {
-      data,
-      meta: {
-        page,
-        limit,
-        total,
-        totalPages: Math.ceil(total / limit),
-      },
-    };
+    return this.listUsers(
+      query.isActive,
+      UserRole.RIDER,
+      query.page,
+      query.limit,
+    );
   }
 
   async listCustomers(query: ListCustomersQueryDto) {
-    const where: Prisma.UserWhereInput = { role: UserRole.CUSTOMER };
-
-    if (query.isActive !== undefined) {
-      where.isActive = query.isActive;
-    }
-
-    const page = query.page ?? 1;
-    const limit = query.limit ?? 20;
-    const skip = (page - 1) * limit;
-
-    const [data, total] = await this.prisma.$transaction([
-      this.prisma.user.findMany({
-        where,
-        orderBy: { createdAt: 'desc' },
-        skip,
-        take: limit,
-        select: publicUserSelect,
-      }),
-      this.prisma.user.count({ where }),
-    ]);
-
-    return {
-      data,
-      meta: {
-        page,
-        limit,
-        total,
-        totalPages: Math.ceil(total / limit),
-      },
-    };
+    return this.listUsers(
+      query.isActive,
+      UserRole.CUSTOMER,
+      query.page,
+      query.limit,
+    );
   }
 
   async updateUserStatus(
     admin: AuthenticatedUser,
     userId: string,
     isActive: boolean,
-  ) {
-    const user = await this.prisma.user.findUnique({
-      where: { id: userId },
-      select: { id: true, role: true, isActive: true },
-    });
+  ): Promise<PublicUser> {
+    const user = (await UserModel.findOne({ _id: userId })
+      .select('_id role isActive')
+      .lean()) as unknown as Pick<UserDoc, '_id' | 'role' | 'isActive'> | null;
 
     if (!user) {
       throw new NotFoundException('User not found');
@@ -260,11 +235,9 @@ export class AdminService {
     }
 
     if (!isActive && user.role === UserRole.RIDER) {
-      const activeDeliveries = await this.prisma.delivery.count({
-        where: {
-          riderId: userId,
-          status: { in: ACTIVE_DELIVERY_STATUSES },
-        },
+      const activeDeliveries = await DeliveryModel.countDocuments({
+        riderId: userId,
+        status: { $in: ACTIVE_DELIVERY_STATUSES },
       });
 
       if (activeDeliveries > 0) {
@@ -274,21 +247,28 @@ export class AdminService {
       }
     }
 
-    const updated = await this.prisma.$transaction(async (tx) => {
-      const result = await tx.user.update({
-        where: { id: userId },
-        data: { isActive },
-        select: publicUserSelect,
-      });
+    const updated = await this.database.withTransaction(async (session) => {
+      const user = (await UserModel.findOneAndUpdate(
+        { _id: userId },
+        { $set: { isActive } },
+        { new: true, session },
+      )
+        .select(USER_PUBLIC_FIELDS)
+        .lean()) as unknown as UserDoc | null;
 
-      if (!isActive) {
-        await tx.refreshToken.updateMany({
-          where: { userId, revokedAt: null },
-          data: { revokedAt: new Date() },
-        });
+      if (!user) {
+        throw new NotFoundException('User not found');
       }
 
-      return result;
+      if (!isActive) {
+        await RefreshTokenModel.updateMany(
+          { userId, revokedAt: null },
+          { $set: { revokedAt: new Date() } },
+          { session },
+        );
+      }
+
+      return toPublicUser(user);
     });
 
     if (user.isActive !== isActive) {
@@ -305,7 +285,7 @@ export class AdminService {
   }
 
   async listOrders(query: ListAdminOrdersQueryDto) {
-    const where: Prisma.OrderWhereInput = {};
+    const where: Record<string, unknown> = {};
 
     if (query.status) {
       where.status = query.status;
@@ -316,33 +296,33 @@ export class AdminService {
     }
 
     if (query.riderId) {
-      where.delivery = { is: { riderId: query.riderId } };
+      where._id = {
+        $in: await DeliveryModel.find({ riderId: query.riderId }).distinct(
+          'orderId',
+        ),
+      };
     }
 
     if (query.orderNumber) {
-      where.orderNumber = {
-        contains: query.orderNumber,
-        mode: 'insensitive',
-      };
+      where.orderNumber = new RegExp(escapeRegex(query.orderNumber), 'i');
     }
 
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
     const skip = (page - 1) * limit;
 
-    const [data, total] = await this.prisma.$transaction([
-      this.prisma.order.findMany({
-        where,
-        orderBy: { createdAt: 'desc' },
-        skip,
-        take: limit,
-        select: orderSelect,
-      }),
-      this.prisma.order.count({ where }),
+    const [data, total] = await Promise.all([
+      OrderModel.find(where)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .populate(orderPopulate)
+        .lean(),
+      OrderModel.countDocuments(where),
     ]);
 
     return {
-      data,
+      data: (data as unknown as OrderDoc[]).map(toOrderView),
       meta: {
         page,
         limit,
@@ -353,7 +333,7 @@ export class AdminService {
   }
 
   async listPayments(query: ListAdminPaymentsQueryDto) {
-    const where: Prisma.PaymentWhereInput = {};
+    const where: Record<string, unknown> = {};
 
     if (query.status) {
       where.status = query.status;
@@ -364,33 +344,59 @@ export class AdminService {
     }
 
     if (query.customerId) {
-      where.order = { customerId: query.customerId };
+      where.orderId = {
+        $in: await OrderModel.find({ customerId: query.customerId }).distinct(
+          '_id',
+        ),
+      };
     }
 
     if (query.providerReference) {
-      where.providerReference = {
-        contains: query.providerReference,
-        mode: 'insensitive',
-      };
+      where.providerReference = new RegExp(
+        escapeRegex(query.providerReference),
+        'i',
+      );
     }
 
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
     const skip = (page - 1) * limit;
 
-    const [data, total] = await this.prisma.$transaction([
-      this.prisma.payment.findMany({
-        where,
-        orderBy: { createdAt: 'desc' },
-        skip,
-        take: limit,
-        select: paymentSelect,
-      }),
-      this.prisma.payment.count({ where }),
+    const [data, total] = await Promise.all([
+      PaymentModel.find(where)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .populate(paymentPopulate)
+        .lean(),
+      PaymentModel.countDocuments(where),
     ]);
 
     return {
-      data,
+      data: (data as unknown as PaymentDoc[]).map((payment) => {
+        if (!payment.order) {
+          throw new NotFoundException('Payment order was not found');
+        }
+
+        return {
+          id: payment._id,
+          orderId: payment.orderId,
+          provider: payment.provider ?? null,
+          providerReference: payment.providerReference ?? null,
+          amount: payment.amount,
+          currency: payment.currency,
+          status: payment.status,
+          paidAt: payment.paidAt ?? null,
+          createdAt: payment.createdAt,
+          updatedAt: payment.updatedAt,
+          order: {
+            id: payment.order._id,
+            orderNumber: payment.order.orderNumber,
+            customerId: payment.order.customerId,
+            status: payment.order.status,
+          },
+        };
+      }),
       meta: {
         page,
         limit,
@@ -404,6 +410,30 @@ export class AdminService {
     const now = new Date();
     const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
 
+    const statuses = {
+      orders: [
+        OrderStatus.PENDING_PAYMENT,
+        OrderStatus.CONFIRMED,
+        OrderStatus.CANCELLED,
+      ],
+      deliveries: [
+        DeliveryStatus.PENDING_ASSIGNMENT,
+        DeliveryStatus.ASSIGNED,
+        DeliveryStatus.ACCEPTED,
+        DeliveryStatus.PICKED_UP,
+        DeliveryStatus.IN_TRANSIT,
+        DeliveryStatus.DELIVERED,
+        DeliveryStatus.FAILED,
+        DeliveryStatus.CANCELLED,
+      ],
+      payments: [
+        PaymentStatus.PENDING,
+        PaymentStatus.SUCCEEDED,
+        PaymentStatus.FAILED,
+        PaymentStatus.REFUNDED,
+      ],
+    } as const;
+
     const [
       orderGroups,
       ordersCreatedLast7Days,
@@ -411,76 +441,60 @@ export class AdminService {
       deliveriesCompletedLast7Days,
       deliveriesFailedLast7Days,
       paymentGroups,
-      revenueGroups,
-      revenueLast7DaysGroups,
+      succeededPayments,
+      ridersWithActiveDeliveries,
       totalRiders,
       activeRiders,
-      ridersWithActiveDeliveries,
     ] = await Promise.all([
-      this.prisma.order.groupBy({
-        by: ['status'],
-        _count: { _all: true },
+      countByStatus(
+        OrderModel.aggregate([
+          { $group: { _id: '$status', count: { $sum: 1 } } },
+        ]) as Promise<Array<{ _id: OrderStatus; count: number }>>,
+        statuses.orders,
+      ),
+      OrderModel.countDocuments({ createdAt: { $gte: sevenDaysAgo } }),
+      countByStatus(
+        DeliveryModel.aggregate([
+          { $group: { _id: '$status', count: { $sum: 1 } } },
+        ]) as Promise<Array<{ _id: DeliveryStatus; count: number }>>,
+        statuses.deliveries,
+      ),
+      DeliveryModel.countDocuments({
+        status: DeliveryStatus.DELIVERED,
+        deliveredAt: { $gte: sevenDaysAgo },
       }),
-      this.prisma.order.count({ where: { createdAt: { gte: sevenDaysAgo } } }),
-      this.prisma.delivery.groupBy({
-        by: ['status'],
-        _count: { _all: true },
+      DeliveryModel.countDocuments({
+        status: DeliveryStatus.FAILED,
+        updatedAt: { $gte: sevenDaysAgo },
       }),
-      this.prisma.delivery.count({
-        where: {
-          status: DeliveryStatus.DELIVERED,
-          deliveredAt: { gte: sevenDaysAgo },
-        },
+      countByStatus(
+        PaymentModel.aggregate([
+          { $group: { _id: '$status', count: { $sum: 1 } } },
+        ]) as Promise<Array<{ _id: PaymentStatus; count: number }>>,
+        statuses.payments,
+      ),
+      PaymentModel.find({ status: PaymentStatus.SUCCEEDED })
+        .select('amount currency paidAt')
+        .lean(),
+      DeliveryModel.distinct('riderId', {
+        riderId: { $ne: null },
+        status: { $in: ACTIVE_DELIVERY_STATUSES },
       }),
-      this.prisma.delivery.count({
-        where: {
-          status: DeliveryStatus.FAILED,
-          updatedAt: { gte: sevenDaysAgo },
-        },
-      }),
-      this.prisma.payment.groupBy({
-        by: ['status'],
-        _count: { _all: true },
-      }),
-      this.prisma.payment.groupBy({
-        by: ['currency'],
-        where: { status: PaymentStatus.SUCCEEDED },
-        _sum: { amount: true },
-        orderBy: { currency: 'asc' },
-      }),
-      this.prisma.payment.groupBy({
-        by: ['currency'],
-        where: {
-          status: PaymentStatus.SUCCEEDED,
-          paidAt: { gte: sevenDaysAgo },
-        },
-        _sum: { amount: true },
-        orderBy: { currency: 'asc' },
-      }),
-      this.prisma.user.count({ where: { role: UserRole.RIDER } }),
-      this.prisma.user.count({
-        where: { role: UserRole.RIDER, isActive: true },
-      }),
-      this.prisma.delivery.groupBy({
-        by: ['riderId'],
-        where: {
-          riderId: { not: null },
-          status: { in: ACTIVE_DELIVERY_STATUSES },
-        },
-        _count: { _all: true },
-      }),
+      UserModel.countDocuments({ role: UserRole.RIDER }),
+      UserModel.countDocuments({ role: UserRole.RIDER, isActive: true }),
     ]);
 
+    const payments = succeededPayments as unknown as PaymentDoc[];
     const totalOrders = orderGroups.reduce(
-      (sum, group) => sum + group._count._all,
+      (sum, group) => sum + group.count,
       0,
     );
     const totalDeliveries = deliveryGroups.reduce(
-      (sum, group) => sum + group._count._all,
+      (sum, group) => sum + group.count,
       0,
     );
     const totalPayments = paymentGroups.reduce(
-      (sum, group) => sum + group._count._all,
+      (sum, group) => sum + group.count,
       0,
     );
     const activeDeliveryCount = ACTIVE_DELIVERY_STATUSES.reduce(
@@ -520,14 +534,12 @@ export class AdminService {
         succeeded: groupCount(paymentGroups, PaymentStatus.SUCCEEDED),
         failed: groupCount(paymentGroups, PaymentStatus.FAILED),
         refunded: groupCount(paymentGroups, PaymentStatus.REFUNDED),
-        revenueByCurrency: revenueGroups.map((group) => ({
-          currency: group.currency,
-          amount: group._sum.amount?.toFixed(2) ?? '0.00',
-        })),
-        revenueLast7DaysByCurrency: revenueLast7DaysGroups.map((group) => ({
-          currency: group.currency,
-          amount: group._sum.amount?.toFixed(2) ?? '0.00',
-        })),
+        revenueByCurrency: sumAmounts(payments),
+        revenueLast7DaysByCurrency: sumAmounts(
+          payments.filter(
+            (payment) => payment.paidAt && payment.paidAt >= sevenDaysAgo,
+          ),
+        ),
       },
       riders: {
         total: totalRiders,
@@ -539,17 +551,16 @@ export class AdminService {
   }
 
   async listRiderPerformance(query: RiderPerformanceQueryDto) {
-    const where: Prisma.UserWhereInput = { role: UserRole.RIDER };
+    const where: Record<string, unknown> = { role: UserRole.RIDER };
 
     if (query.isActive !== undefined) {
       where.isActive = query.isActive;
     }
 
-    const riders = await this.prisma.user.findMany({
-      where,
-      orderBy: { fullName: 'asc' },
-      select: publicUserSelect,
-    });
+    const riders = (await UserModel.find(where)
+      .sort({ fullName: 1 })
+      .select(USER_PUBLIC_FIELDS)
+      .lean()) as unknown as UserDoc[];
 
     if (riders.length === 0) {
       return {
@@ -563,25 +574,25 @@ export class AdminService {
       };
     }
 
-    const riderIds = riders.map((rider) => rider.id);
+    const riderIds = riders.map((rider) => rider._id);
     const [assignmentGroups, deliveries] = await Promise.all([
-      this.prisma.deliveryAssignment.groupBy({
-        by: ['riderId'],
-        where: { riderId: { in: riderIds } },
-        _count: { _all: true },
-      }),
-      this.prisma.delivery.findMany({
-        where: { riderId: { in: riderIds } },
-        select: { ...riderDeliveryMetricSelect, riderId: true },
-      }),
+      DeliveryAssignmentModel.aggregate([
+        { $match: { riderId: { $in: riderIds } } },
+        { $group: { _id: '$riderId', count: { $sum: 1 } } },
+      ]) as Promise<Array<{ _id: string; count: number }>>,
+      DeliveryModel.find({ riderId: { $in: riderIds } })
+        .select(`${RIDER_DELIVERY_METRIC_FIELDS} riderId`)
+        .lean(),
     ]);
 
     const assignmentCounts = new Map(
-      assignmentGroups.map((group) => [group.riderId, group._count._all]),
+      assignmentGroups.map((group) => [group._id, group.count]),
     );
     const deliveriesByRider = new Map<string, RiderDeliveryMetric[]>();
 
-    for (const delivery of deliveries) {
+    for (const delivery of deliveries as unknown as Array<
+      RiderDeliveryMetric & { riderId: string | null }
+    >) {
       if (!delivery.riderId) {
         continue;
       }
@@ -592,10 +603,10 @@ export class AdminService {
     }
 
     const data = riders.map((rider) => ({
-      rider,
+      rider: toPublicUser(rider),
       metrics: calculateRiderMetrics(
-        deliveriesByRider.get(rider.id) ?? [],
-        assignmentCounts.get(rider.id) ?? 0,
+        deliveriesByRider.get(rider._id) ?? [],
+        assignmentCounts.get(rider._id) ?? 0,
       ),
     }));
 
@@ -631,33 +642,93 @@ export class AdminService {
   }
 
   async getRiderPerformance(riderId: string) {
-    const rider = await this.prisma.user.findFirst({
-      where: { id: riderId, role: UserRole.RIDER },
-      select: publicUserSelect,
-    });
+    const rider = (await UserModel.findOne({
+      _id: riderId,
+      role: UserRole.RIDER,
+    })
+      .select(USER_PUBLIC_FIELDS)
+      .lean()) as unknown as UserDoc | null;
 
     if (!rider) {
       throw new NotFoundException('Rider not found');
     }
 
     const [totalAssignments, deliveries, recentDeliveries] = await Promise.all([
-      this.prisma.deliveryAssignment.count({ where: { riderId } }),
-      this.prisma.delivery.findMany({
-        where: { riderId },
-        select: riderDeliveryMetricSelect,
-      }),
-      this.prisma.delivery.findMany({
-        where: { riderId },
-        orderBy: { createdAt: 'desc' },
-        take: 10,
-        select: riderRecentDeliverySelect,
-      }),
+      DeliveryAssignmentModel.countDocuments({ riderId }),
+      DeliveryModel.find({ riderId })
+        .select(RIDER_DELIVERY_METRIC_FIELDS)
+        .lean(),
+      DeliveryModel.find({ riderId })
+        .sort({ createdAt: -1 })
+        .limit(10)
+        .populate('order', RIDER_RECENT_DELIVERY_ORDER_FIELDS)
+        .lean(),
     ]);
 
     return {
-      rider,
-      metrics: calculateRiderMetrics(deliveries, totalAssignments),
-      recentDeliveries,
+      rider: toPublicUser(rider),
+      metrics: calculateRiderMetrics(
+        deliveries as unknown as RiderDeliveryMetric[],
+        totalAssignments,
+      ),
+      recentDeliveries: (recentDeliveries as unknown as DeliveryDoc[]).map(
+        (delivery) => ({
+          id: delivery._id,
+          status: delivery.status,
+          assignedAt: delivery.assignedAt,
+          acceptedAt: delivery.acceptedAt,
+          pickedUpAt: delivery.pickedUpAt,
+          deliveredAt: delivery.deliveredAt,
+          failureReason: delivery.failureReason,
+          createdAt: delivery.createdAt,
+          order: delivery.order
+            ? {
+                id: delivery.order._id,
+                orderNumber: delivery.order.orderNumber,
+                pickupAddress: delivery.order.pickupAddress,
+                deliveryAddress: delivery.order.deliveryAddress,
+                deliveryFee: delivery.order.deliveryFee,
+                currency: delivery.order.currency,
+                status: delivery.order.status,
+              }
+            : null,
+        }),
+      ),
+    };
+  }
+
+  private async listUsers(
+    isActive: boolean | undefined,
+    role: UserRole,
+    page = 1,
+    limit = 20,
+  ) {
+    const where: Record<string, unknown> = { role };
+
+    if (isActive !== undefined) {
+      where.isActive = isActive;
+    }
+
+    const skip = (page - 1) * limit;
+
+    const [data, total] = await Promise.all([
+      UserModel.find(where)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .select(USER_PUBLIC_FIELDS)
+        .lean(),
+      UserModel.countDocuments(where),
+    ]);
+
+    return {
+      data: (data as unknown as UserDoc[]).map(toPublicUser),
+      meta: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
     };
   }
 

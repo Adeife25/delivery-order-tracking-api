@@ -1,14 +1,64 @@
 import { jest } from '@jest/globals';
 import { Logger } from '@nestjs/common';
-import { NotificationStatus } from '../generated/prisma/client';
-import { PrismaService } from '../prisma/prisma.service';
-import { EmailSender } from './email.sender';
-import { NotificationsQueue } from './notifications.queue';
-import { NotificationsService } from './notifications.service';
+import type { DatabaseService } from '../database/database.service';
+import { NotificationStatus } from '../database/enums';
+import type { EmailSender } from './email.sender';
+import type { NotificationsQueue } from './notifications.queue';
+
+type AsyncMock = jest.Mock<(...args: unknown[]) => Promise<unknown>>;
+
+interface FakeQuery {
+  populate: jest.Mock;
+  sort: jest.Mock;
+  skip: jest.Mock;
+  limit: jest.Mock;
+  select: jest.Mock;
+  lean: AsyncMock;
+}
+
+function createFakeQuery(): FakeQuery {
+  const query = {
+    populate: jest.fn(),
+    sort: jest.fn(),
+    skip: jest.fn(),
+    limit: jest.fn(),
+    select: jest.fn(),
+    lean: jest.fn(),
+  } as unknown as FakeQuery;
+
+  query.populate.mockReturnValue(query);
+  query.sort.mockReturnValue(query);
+  query.skip.mockReturnValue(query);
+  query.limit.mockReturnValue(query);
+  query.select.mockReturnValue(query);
+  query.lean.mockResolvedValue([]);
+  return query;
+}
+
+const notificationModel = {
+  create: jest.fn(async (): Promise<unknown> => []),
+  findById: jest.fn((): unknown => ({})),
+  find: jest.fn((): unknown => ({})),
+  updateOne: jest.fn(async (): Promise<unknown> => ({ modifiedCount: 1 })),
+  countDocuments: jest.fn(async (): Promise<unknown> => 0),
+};
+
+jest.unstable_mockModule('../database/database.service', () => ({
+  DatabaseService: class {},
+  isDuplicateKeyError: () => false,
+  sessionOptions: () => ({}),
+}));
+jest.unstable_mockModule('../database/models', () => ({
+  NotificationModel: notificationModel,
+}));
+
+const { NotificationsService } = await import('./notifications.service');
 
 function notification(overrides: Record<string, unknown> = {}) {
   return {
-    id: 'notification-1',
+    _id: 'notification-1',
+    userId: 'user-1',
+    type: 'DELIVERY_UPDATE',
     status: NotificationStatus.PENDING,
     attempts: 0,
     nextAttemptAt: null,
@@ -20,47 +70,43 @@ function notification(overrides: Record<string, unknown> = {}) {
 }
 
 describe('NotificationsService', () => {
-  let prisma: {
-    notification: {
-      create: jest.Mock;
-      findUnique: jest.Mock;
-      findMany: jest.Mock;
-      updateMany: jest.Mock;
-    };
-  };
-  let emailSender: { send: jest.Mock };
+  let service: InstanceType<typeof NotificationsService>;
+  let emailSender: { send: AsyncMock };
   let queue: {
     isEnabled: jest.Mock;
-    enqueue: jest.Mock;
+    enqueue: AsyncMock;
     scheduleSweep: jest.Mock;
   };
-  let service: NotificationsService;
-  let logger: jest.SpyInstance;
+  let logger: { mockRestore(): void };
+  let findByIdQuery: FakeQuery;
+  let findQuery: FakeQuery;
 
   beforeEach(() => {
     logger = jest
       .spyOn(Logger.prototype, 'error')
       .mockImplementation(() => undefined);
 
-    prisma = {
-      notification: {
-        create: jest.fn().mockResolvedValue({ id: 'notification-1' }),
-        findUnique: jest.fn().mockResolvedValue(notification()),
-        findMany: jest.fn().mockResolvedValue([]),
-        updateMany: jest
-          .fn()
-          .mockResolvedValueOnce({ count: 1 })
-          .mockResolvedValueOnce({ count: 1 }),
-      },
-    };
-    emailSender = { send: jest.fn() };
+    findByIdQuery = createFakeQuery();
+    findQuery = createFakeQuery();
+    notificationModel.create
+      .mockReset()
+      .mockResolvedValue([{ _id: 'notification-1' }]);
+    notificationModel.findById.mockReset().mockReturnValue(findByIdQuery);
+    notificationModel.find.mockReset().mockReturnValue(findQuery);
+    notificationModel.updateOne
+      .mockReset()
+      .mockResolvedValue({ modifiedCount: 1 });
+    findByIdQuery.lean.mockResolvedValue(notification());
+    findQuery.lean.mockResolvedValue([]);
+
+    emailSender = { send: jest.fn(async (): Promise<unknown> => undefined) };
     queue = {
-      isEnabled: jest.fn().mockReturnValue(false),
-      enqueue: jest.fn().mockResolvedValue(false),
+      isEnabled: jest.fn(() => false),
+      enqueue: jest.fn(async (): Promise<unknown> => false),
       scheduleSweep: jest.fn(),
     };
     service = new NotificationsService(
-      prisma as unknown as PrismaService,
+      {} as DatabaseService,
       emailSender as unknown as EmailSender,
       queue as unknown as NotificationsQueue,
     );
@@ -74,29 +120,30 @@ describe('NotificationsService', () => {
     await service.dispatch('notification-1');
 
     expect(emailSender.send).toHaveBeenCalledTimes(1);
-    expect(prisma.notification.updateMany).toHaveBeenNthCalledWith(1, {
-      where: {
-        id: 'notification-1',
+    expect(notificationModel.updateOne).toHaveBeenNthCalledWith(
+      1,
+      {
+        _id: 'notification-1',
         status: NotificationStatus.PENDING,
         attempts: 0,
-        OR: [
+        $or: [
           { nextAttemptAt: null },
-          { nextAttemptAt: { lte: expect.any(Date) } },
+          { nextAttemptAt: { $lte: expect.any(Date) } },
         ],
       },
-      data: { attempts: { increment: 1 } },
-    });
-    expect(prisma.notification.updateMany).toHaveBeenNthCalledWith(2, {
-      where: {
-        id: 'notification-1',
-        status: NotificationStatus.PENDING,
+      { $inc: { attempts: 1 } },
+    );
+    expect(notificationModel.updateOne).toHaveBeenNthCalledWith(
+      2,
+      { _id: 'notification-1', status: NotificationStatus.PENDING },
+      {
+        $set: {
+          status: NotificationStatus.SENT,
+          sentAt: expect.any(Date),
+          nextAttemptAt: null,
+        },
       },
-      data: {
-        status: NotificationStatus.SENT,
-        sentAt: expect.any(Date),
-        nextAttemptAt: null,
-      },
-    });
+    );
   });
 
   it('schedules a retry after a failed attempt', async () => {
@@ -105,71 +152,68 @@ describe('NotificationsService', () => {
     await service.dispatch('notification-1');
 
     expect(emailSender.send).toHaveBeenCalledTimes(1);
-    expect(prisma.notification.updateMany).toHaveBeenNthCalledWith(2, {
-      where: {
-        id: 'notification-1',
-        status: NotificationStatus.PENDING,
-      },
-      data: { nextAttemptAt: expect.any(Date) },
-    });
+    expect(notificationModel.updateOne).toHaveBeenNthCalledWith(
+      2,
+      { _id: 'notification-1', status: NotificationStatus.PENDING },
+      { $set: { nextAttemptAt: expect.any(Date) } },
+    );
   });
 
   it('marks the notification as failed after the final attempt', async () => {
-    prisma.notification.findUnique.mockResolvedValue(
-      notification({ attempts: 2 }),
-    );
+    findByIdQuery.lean.mockResolvedValue(notification({ attempts: 2 }));
     emailSender.send.mockRejectedValue(new Error('permanent failure'));
 
     await service.dispatch('notification-1');
 
-    expect(prisma.notification.updateMany).toHaveBeenNthCalledWith(2, {
-      where: {
-        id: 'notification-1',
-        status: NotificationStatus.PENDING,
-      },
-      data: {
-        status: NotificationStatus.FAILED,
-        nextAttemptAt: null,
-      },
-    });
+    expect(notificationModel.updateOne).toHaveBeenNthCalledWith(
+      2,
+      { _id: 'notification-1', status: NotificationStatus.PENDING },
+      { $set: { status: NotificationStatus.FAILED, nextAttemptAt: null } },
+    );
   });
 
   it('does not send a notification before its next attempt time', async () => {
-    prisma.notification.findUnique.mockResolvedValue(
+    findByIdQuery.lean.mockResolvedValue(
       notification({ nextAttemptAt: new Date(Date.now() + 60_000) }),
     );
 
     await service.dispatch('notification-1');
 
     expect(emailSender.send).not.toHaveBeenCalled();
-    expect(prisma.notification.updateMany).not.toHaveBeenCalled();
+    expect(notificationModel.updateOne).not.toHaveBeenCalled();
   });
 
-  it('creates pending notifications through the supplied transaction', async () => {
-    const create = jest.fn().mockResolvedValue({ id: 'notification-2' });
+  it('creates pending notifications with the supplied session', async () => {
+    notificationModel.create.mockResolvedValue([{ _id: 'notification-2' }]);
+    const session = {} as Parameters<
+      InstanceType<typeof NotificationsService>['createInTransaction']
+    >[1];
 
     await expect(
       service.createInTransaction(
-        { notification: { create } } as unknown as Prisma.TransactionClient,
         {
           userId: 'user-1',
           type: 'ORDER_CREATED',
           title: 'Order created',
           message: 'Your order has been received.',
         },
+        session,
       ),
     ).resolves.toBe('notification-2');
 
-    expect(create).toHaveBeenCalledWith({
-      data: {
-        userId: 'user-1',
-        type: 'ORDER_CREATED',
-        title: 'Order created',
-        message: 'Your order has been received.',
-        status: NotificationStatus.PENDING,
-      },
-      select: { id: true },
-    });
+    expect(notificationModel.create).toHaveBeenCalledWith(
+      [
+        {
+          userId: 'user-1',
+          type: 'ORDER_CREATED',
+          title: 'Order created',
+          message: 'Your order has been received.',
+          status: NotificationStatus.PENDING,
+          attempts: 0,
+        },
+      ],
+      { session },
+    );
   });
 
   it('enqueues every notification id', async () => {
@@ -184,7 +228,7 @@ describe('NotificationsService', () => {
   });
 
   it('retries pending notifications that are due', async () => {
-    prisma.notification.findMany.mockResolvedValue([{ id: 'notification-1' }]);
+    findQuery.lean.mockResolvedValue([{ _id: 'notification-1' }]);
     const dispatch = jest
       .spyOn(service, 'dispatch')
       .mockResolvedValue(undefined);
@@ -192,16 +236,12 @@ describe('NotificationsService', () => {
     await service.retryPending();
 
     expect(dispatch).toHaveBeenCalledWith('notification-1');
-    expect(prisma.notification.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: {
-          status: NotificationStatus.PENDING,
-          OR: [
-            { nextAttemptAt: null },
-            { nextAttemptAt: { lte: expect.any(Date) } },
-          ],
-        },
-      }),
-    );
+    expect(notificationModel.find).toHaveBeenCalledWith({
+      status: NotificationStatus.PENDING,
+      $or: [
+        { nextAttemptAt: null },
+        { nextAttemptAt: { $lte: expect.any(Date) } },
+      ],
+    });
   });
 });

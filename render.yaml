@@ -1,10 +1,6 @@
-databases:
-  - name: delivery-tracking-db
-    databaseName: delivery_tracking
-    user: delivery_tracking
-    plan: free
-    region: oregon
-
+# MongoDB is provided by MongoDB Atlas. Use an M10+ cluster (a replica set is
+# required for transactions); set DATABASE_URL to the mongodb+srv:// URI in the
+# Render dashboard. DATABASE_URL is sync:false so it is never stored here.
 services:
   - type: redis
     name: delivery-tracking-redis
@@ -18,8 +14,8 @@ services:
     runtime: node
     plan: free
     region: oregon
-    buildCommand: npm ci --include=dev && npm run db:generate && npm run build
-    startCommand: npm run db:migrate:deploy && npm run start:prod
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm run start:prod
     healthCheckPath: /api/v1/health/ready
     envVars:
       - key: NODE_ENV
@@ -29,9 +25,7 @@ services:
       - key: TRUST_PROXY
         value: 'true'
       - key: DATABASE_URL
-        fromDatabase:
-          name: delivery-tracking-db
-          property: connectionString
+        sync: false
       - key: REDIS_URL
         fromService:
           type: redis

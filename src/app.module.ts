@@ -10,12 +10,12 @@ import { AuditModule } from './audit/audit.module';
 import { AuthModule } from './auth/auth.module';
 import { RateLimitGuard } from './common/rate-limit.guard';
 import { validateEnvironment } from './config/environment.validation';
+import { DatabaseModule } from './database/database.module';
 import { DeliveriesModule } from './deliveries/deliveries.module';
 import { HealthModule } from './health/health.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { OrdersModule } from './orders/orders.module';
 import { PaymentsModule } from './payments/payments.module';
-import { PrismaModule } from './prisma/prisma.module';
 import { RedisModule } from './redis/redis.module';
 import { TrackingModule } from './tracking/tracking.module';
 import { UsersModule } from './users/users.module';
@@ -60,7 +60,7 @@ import { UsersModule } from './users/users.module';
     }),
     ScheduleModule.forRoot(),
     RedisModule,
-    PrismaModule,
+    DatabaseModule,
     AuditModule,
     AuthModule,
     UsersModule,

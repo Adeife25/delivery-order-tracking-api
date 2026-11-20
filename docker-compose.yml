@@ -1,34 +1,52 @@
+# MongoDB runs as a single-node replica set so multi-document transactions work.
+# The set advertises "mongo:27017" so containers on this network can discover it.
 services:
   api:
     build: .
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/delivery_tracking?schema=public
+      DATABASE_URL: mongodb://mongo:27017/delivery_tracking?replicaSet=rs0
       REDIS_URL: redis://redis:6379
       PORT: 3000
     ports:
       - "3000:3000"
     depends_on:
-      postgres:
+      mongo-init:
+        condition: service_completed_successfully
+      mongo:
         condition: service_healthy
       redis:
         condition: service_healthy
-  postgres:
-    image: postgres:17-alpine
-    environment:
-      POSTGRES_DB: delivery_tracking
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+  mongo:
+    image: mongo:7
+    command: ["--replSet", "rs0", "--bind_ip_all"]
     ports:
-      - "${POSTGRES_HOST_PORT:-5432}:5432"
+      - "27017:27017"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - mongo_data:/data/db
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d delivery_tracking"]
+      test:
+        - CMD-SHELL
+        - >-
+          mongosh --quiet --eval "try { db.adminCommand('hello').isWritablePrimary }
+          catch (e) { false }" | grep -q true
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+  mongo-init:
+    image: mongo:7
+    depends_on:
+      - mongo
+    restart: "no"
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        until mongosh --host mongo:27017 --quiet --eval "db.adminCommand({ ping: 1 }).ok" >/dev/null 2>&1; do
+          sleep 1
+        done
+        mongosh --host mongo:27017 --quiet --eval "try { rs.status().ok } catch (e) { rs.initiate({ _id: 'rs0', members: [{ _id: 0, host: 'mongo:27017' }] }).ok }"
   redis:
     image: redis:7-alpine
     command:
@@ -50,5 +68,5 @@ services:
       retries: 5
 
 volumes:
-  postgres_data:
+  mongo_data:
   redis_data:

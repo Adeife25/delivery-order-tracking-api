@@ -2,34 +2,63 @@ import { jest } from '@jest/globals';
 import { ConflictException, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as bcrypt from 'bcrypt';
-import { UserRole } from '../generated/prisma/enums';
-import { UsersService } from '../users/users.service';
-import { AuthService } from './auth.service';
-import { TokenService } from './token.service';
+import { UserRole } from '../database/enums';
+import type { UsersService } from '../users/users.service';
+import type { TokenService } from './token.service';
+
+jest.unstable_mockModule('../database/database.service', () => ({
+  DatabaseService: class {},
+  isDuplicateKeyError: (error: unknown) =>
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { code?: number }).code === 11000,
+  sessionOptions: () => ({}),
+}));
+jest.unstable_mockModule('../users/users.service', () => ({
+  UsersService: class {},
+}));
+jest.unstable_mockModule('./token.service', () => ({
+  TokenService: class {},
+}));
+
+const { AuthService } = await import('./auth.service');
+
+type AsyncMock = jest.Mock<(...args: unknown[]) => Promise<unknown>>;
 
 describe('AuthService', () => {
-  let service: AuthService;
+  let service: InstanceType<typeof AuthService>;
   let usersService: {
-    findByEmail: jest.Mock;
-    createCustomer: jest.Mock;
+    findByEmail: AsyncMock;
+    createCustomer: AsyncMock;
   };
   let tokenService: {
-    issueTokenPair: jest.Mock;
-    verifyRefreshToken: jest.Mock;
-    findActiveRefreshToken: jest.Mock;
-    revokeRefreshToken: jest.Mock;
+    issueTokenPair: AsyncMock;
+    verifyRefreshToken: AsyncMock;
+    findActiveRefreshToken: AsyncMock;
+    revokeRefreshToken: AsyncMock;
   };
 
   const password = 'strong-password-123';
-  const publicUser = {
-    id: '11111111-1111-4111-8111-111111111111',
+  const userDoc = {
+    _id: '64b7f9d2e1a2b3c4d5e6f700',
     fullName: 'Ada Obi',
     email: 'ada@example.com',
     phoneNumber: null,
     role: UserRole.CUSTOMER,
     isActive: true,
+    passwordHash: 'stored-hash',
     createdAt: new Date('2026-01-01T00:00:00.000Z'),
     updatedAt: new Date('2026-01-01T00:00:00.000Z'),
+  };
+  const publicUser = {
+    id: userDoc._id,
+    fullName: userDoc.fullName,
+    email: userDoc.email,
+    phoneNumber: userDoc.phoneNumber,
+    role: userDoc.role,
+    isActive: userDoc.isActive,
+    createdAt: userDoc.createdAt,
+    updatedAt: userDoc.updatedAt,
   };
   const tokenPair = {
     accessToken: 'access-token',
@@ -88,7 +117,7 @@ describe('AuthService', () => {
     });
 
     it('rejects an existing email', async () => {
-      usersService.findByEmail.mockResolvedValue(publicUser);
+      usersService.findByEmail.mockResolvedValue(userDoc);
 
       await expect(
         service.register({
@@ -105,7 +134,7 @@ describe('AuthService', () => {
     it('returns tokens and a public user for valid credentials', async () => {
       const passwordHash = await bcrypt.hash(password, 4);
       usersService.findByEmail.mockResolvedValue({
-        ...publicUser,
+        ...userDoc,
         passwordHash,
       });
       tokenService.issueTokenPair.mockResolvedValue(tokenPair);
@@ -118,7 +147,7 @@ describe('AuthService', () => {
       expect(result).toEqual({ ...tokenPair, user: publicUser });
       expect(result.user).not.toHaveProperty('passwordHash');
       expect(tokenService.issueTokenPair).toHaveBeenCalledWith(
-        expect.objectContaining({ id: publicUser.id }),
+        expect.objectContaining({ id: userDoc._id }),
       );
     });
 
@@ -133,7 +162,7 @@ describe('AuthService', () => {
     it('rejects a wrong password', async () => {
       const passwordHash = await bcrypt.hash(password, 4);
       usersService.findByEmail.mockResolvedValue({
-        ...publicUser,
+        ...userDoc,
         passwordHash,
       });
 
@@ -147,7 +176,7 @@ describe('AuthService', () => {
 
     it('rejects an inactive account', async () => {
       usersService.findByEmail.mockResolvedValue({
-        ...publicUser,
+        ...userDoc,
         isActive: false,
       });
 
@@ -159,9 +188,9 @@ describe('AuthService', () => {
 
   describe('refresh', () => {
     const storedToken = {
-      userId: publicUser.id,
+      userId: userDoc._id,
       expiresAt: new Date(Date.now() + 60_000),
-      user: publicUser,
+      user: userDoc,
     };
 
     it('rotates a valid refresh token', async () => {

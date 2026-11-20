@@ -1,7 +1,7 @@
 import { Controller, Get, ServiceUnavailableException } from '@nestjs/common';
 import { ApiOkResponse, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Public } from '../auth/decorators/public.decorator';
-import { PrismaService } from '../prisma/prisma.service';
+import { DatabaseService } from '../database/database.service';
 import { RedisService } from '../redis/redis.service';
 
 type DependencyStatus = 'up' | 'down' | 'disabled';
@@ -11,7 +11,7 @@ type DependencyStatus = 'up' | 'down' | 'disabled';
 @Controller('health')
 export class HealthController {
   constructor(
-    private readonly prisma: PrismaService,
+    private readonly database: DatabaseService,
     private readonly redis: RedisService,
   ) {}
 
@@ -52,7 +52,7 @@ export class HealthController {
 
   private async isDatabaseUp(): Promise<boolean> {
     try {
-      await this.prisma.$queryRaw`SELECT 1`;
+      await this.database.ping();
       return true;
     } catch {
       return false;
