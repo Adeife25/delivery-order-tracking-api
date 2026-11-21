@@ -4,6 +4,8 @@ https://delivery-order-tracking-api.onrender.com
 ==>  primary url
 live 🎉
 
+https://delivery-order-tracking-api.onrender.com/api/v1/health/ready
+
 NestJS and TypeScript modular-monolith API for the delivery and order tracking
 system. The application is organized into Auth, Users, Orders, Deliveries,
 Tracking, Payments, Notifications, Admin, and Health modules. Authentication,
