@@ -10,6 +10,12 @@ jobs:
     env:
       DATABASE_URL: mongodb://localhost:27017/delivery_tracking_test?replicaSet=rs0
       REDIS_URL: redis://localhost:6379
+      NPM_CONFIG_FETCH_RETRIES: 5
+      NPM_CONFIG_FETCH_RETRY_FACTOR: 2
+      NPM_CONFIG_FETCH_RETRY_MINTIMEOUT: 10000
+      NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT: 120000
+      NPM_CONFIG_FETCH_TIMEOUT: 300000
+      NPM_CONFIG_MAXSOCKETS: 5
     services:
       redis:
         image: redis:7-alpine
@@ -30,7 +36,7 @@ jobs:
         with:
           mongodb-version: '7.0'
           mongodb-replica-set: rs0
-      - run: npm ci
+      - run: npm ci --prefer-offline
       - run: npm run db:sync:indexes
       - run: npm run format:check
       - run: npm run lint

@@ -2,6 +2,7 @@ FROM node:22-alpine AS build
 WORKDIR /app
 ENV DATABASE_URL=mongodb://localhost:27017/delivery_tracking?replicaSet=rs0
 
+COPY .npmrc ./
 COPY package*.json ./
 RUN npm ci
 
